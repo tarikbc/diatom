@@ -71,6 +71,15 @@ MANIFEST=CORES.md
 # and re-measure every row in docs/reference/core-facts.md that used it, because
 # each of those numbers was made against the old bytes.
 #
+# pcsx_rearmed, pinned 2026-11-03, is the PlayStation, and the first core here
+# that reads discs rather than cartridges: it needs a BIOS in the system
+# directory (scph5501.bin is the US one), takes .cue, .chd, .pbp and .m3u, and
+# hands over a disc tray for multi-disc games, which src/env.c takes. Its
+# software GPU is the NEON one, which is what the aarch64 build reports
+# ("gpu=neon"); the dynarec is ari64. Pure C, needing only libc and the loader,
+# GLIBC_2.34 at most. It reports PCSX-ReARMed r26l-137-g7b0e8f8, which is
+# libretro/pcsx_rearmed 7b0e8f8 (2026-10-29).
+#
 # Fields: name, sha256, bytes, license. License is last so it may contain
 # spaces.
 PINNED_ON=2026-08-26
@@ -81,6 +90,7 @@ pins() {
 	mgba              abde7a0764f08fa0cc2c7d3d9a29b9d1245a9f3b7df0e7a594b74df642ee53c6 3280408 MPLv2.0
 	genesis_plus_gx   3673a22b906509461e23a5a118b1d1bec15cbda105f260cbcbc08a16b2124e48 12589216 Non-commercial
 	mednafen_pce_fast aca90a14b18108c86398da2267ef40d5145eaddbc1c1b310614d745b258552b1 4465432 GPLv2
+	pcsx_rearmed      07cb263f1af645ea60906dbdc8d00ba32cd735bde60cf7d8fbc210118e169808 1761648 GPLv2
 	EOF
 }
 

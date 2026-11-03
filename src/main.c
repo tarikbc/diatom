@@ -1006,6 +1006,90 @@ static void low_battery_set(const diatom_msg *m)
 	low_battery_emit();
 }
 
+/* ---- discs ---------------------------------------------------------------
+ *
+ * Which disc of a multi-disc game is in the tray, and changing it. The game
+ * says when - "insert disc 2" on its own screen - and the player answers from
+ * the launcher's menu, so the launcher asks DISC to know whether to offer the
+ * row at all and sends SETDISC when it is chosen.
+ *
+ * The tray is the core's (env.c takes it from SET_DISK_CONTROL_*), and only a
+ * game that is loaded has discs: idle, or a core with no tray, answers
+ * `count=0`, which a launcher reads as "no disc row", the same as a game on
+ * one disc answering `count=1`. */
+static bool disc_ready(void)
+{
+	return g_core && g_core->game_loaded && g_core->disc_set &&
+	       g_core->disc.get_num_images && g_core->disc.get_image_index;
+}
+
+static void disc_emit(void)
+{
+	const struct retro_disk_control_ext_callback *d;
+	unsigned idx, n;
+	char label[128] = "";
+	bool ejected;
+	size_t i;
+
+	if (!disc_ready()) {
+		diatom_proto_send("DISC	count=0");
+		return;
+	}
+	d = &g_core->disc;
+	n = d->get_num_images();
+	idx = d->get_image_index();
+	ejected = d->get_eject_state && d->get_eject_state();
+	/* The core's own name for the disc: the file's stem for an .m3u entry,
+	 * "Metal Gear Solid (USA) (Disc 1)" style, or what a PBP calls its
+	 * discs. Only the EXT interface has labels; without one the launcher
+	 * counts them itself. Tabs and newlines would break the line protocol. */
+	if (d->get_image_label && idx < n &&
+	    d->get_image_label(idx, label, sizeof label)) {
+		for (i = 0; label[i]; i++)
+			if (label[i] == '\t' || label[i] == '\n' || label[i] == '\r')
+				label[i] = ' ';
+	} else {
+		label[0] = '\0';
+	}
+	diatom_proto_send("DISC\tindex=%u\tcount=%u\tejected=%d%s%s", idx, n,
+	                  ejected ? 1 : 0, label[0] ? "\tlabel=" : "", label);
+}
+
+/* The whole swap in one message: open the tray, change the disc, close it.
+ * The three steps are libretro's, and a launcher sending them one by one
+ * would leave the tray open for as long as its menu took - with
+ * pcsx_rearmed the game sees the lid open and then, two seconds after the
+ * close, a new disc, which is what a PlayStation's own lid looked like.
+ *
+ * Answered with DISC either way, as SETMAP is, so the launcher always knows
+ * which disc is in. A refused index changes nothing. */
+static void disc_set(const diatom_msg *m)
+{
+	const struct retro_disk_control_ext_callback *d;
+	unsigned n;
+	bool ok = false;
+
+	if (disc_ready() && g_core->disc.set_image_index) {
+		d = &g_core->disc;
+		n = d->get_num_images();
+		if (m->index >= 0 && (unsigned)m->index < n) {
+			if (d->set_eject_state) d->set_eject_state(true);
+			ok = d->set_image_index((unsigned)m->index);
+			/* Closed again even when the change failed, so a refusal
+			 * leaves the game with a disc in rather than an open lid. */
+			if (d->set_eject_state) d->set_eject_state(false);
+		}
+	}
+	if (!ok)
+		diatom_proto_send("ERROR\tcode=bad_disc\tmsg=%d", m->index);
+	else {
+		char msg[64];
+		snprintf(msg, sizeof msg, "disc: changed to %d", m->index);
+		diatom_port_log(DIATOM_LOG_INFO, msg);
+	}
+	disc_emit();
+}
+
 /* ---- channels ------------------------------------------------------------
  *
  * Which ears hear what, for a player who hears with one. The launcher decides
@@ -1145,6 +1229,8 @@ static bool state_plane_msg(const diatom_msg *m)
 	case DIATOM_MSG_SETLOWBATTERY: low_battery_set(m); return true;
 	case DIATOM_MSG_CHANNELS:    channels_emit();  return true;
 	case DIATOM_MSG_SETCHANNELS: channels_set(m);  return true;
+	case DIATOM_MSG_DISC:    disc_emit();  return true;
+	case DIATOM_MSG_SETDISC: disc_set(m);  return true;
 	case DIATOM_MSG_PREMAP:
 		/* The launcher has drawn: the cores and the sound device, which both
 		 * waited so as not to compete with its start. */

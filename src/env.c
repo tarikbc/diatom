@@ -21,6 +21,7 @@
 static void capture_descriptors(const struct retro_input_descriptor *d);
 
 static diatom_policy    *g_policy;
+static diatom_core      *g_bound;   /* the core this callback answers for */
 static diatom_port_caps *g_caps;
 static bool              g_geometry_dirty;
 static int               g_new_w, g_new_h;
@@ -385,6 +386,41 @@ static bool env_cb(unsigned cmd, void *data)
 	case MASK(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS):
 		diatom_cheevos_note_support(data ? *(const bool *)data : true);
 		return true;
+
+	/* ---- discs ----------------------------------------------------------- */
+	/* A multi-disc game - one .m3u, or one .pbp holding several discs - needs
+	 * the frontend to change discs when the game asks for the next one, and
+	 * the core gives the frontend its tray through these. Declining them was
+	 * harmless for every cartridge core and is not for pcsx_rearmed, which
+	 * then loads disc 1 and leaves a player at "insert disc 2" for good.
+	 *
+	 * Version 1 is the EXT interface, which adds labels and paths. pcsx_rearmed
+	 * asks for the version from retro_init and hands over EXT when told 1 or
+	 * more, the plain one otherwise; both are taken. Kept on the core, not
+	 * here: see `disc` in diatom.h for why a global would be wrong. */
+	case MASK(RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION):
+		*(unsigned *)data = 1;
+		return true;
+	case MASK(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE):
+		if (!g_bound || !data) return false;
+		g_bound->disc     = *(const struct retro_disk_control_ext_callback *)data;
+		g_bound->disc_set = true;
+		return true;
+	case MASK(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE): {
+		const struct retro_disk_control_callback *d = data;
+
+		if (!g_bound || !d) return false;
+		memset(&g_bound->disc, 0, sizeof g_bound->disc);
+		g_bound->disc.set_eject_state     = d->set_eject_state;
+		g_bound->disc.get_eject_state     = d->get_eject_state;
+		g_bound->disc.get_image_index     = d->get_image_index;
+		g_bound->disc.set_image_index     = d->set_image_index;
+		g_bound->disc.get_num_images      = d->get_num_images;
+		g_bound->disc.replace_image_index = d->replace_image_index;
+		g_bound->disc.add_image_index     = d->add_image_index;
+		g_bound->disc_set = true;
+		return true;
+	}
 
 	case MASK(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME):
 		/* Recorded rather than ignored: such a core is loaded with
@@ -800,6 +836,9 @@ void diatom_env_bind(diatom_core *c, diatom_policy *p, diatom_port_caps *caps)
 {
 	g_policy = p;
 	g_caps   = caps;
+	/* Before set_environment, and for the same reason as the option table
+	 * below: a core may hand over its disc tray from inside that call. */
+	g_bound  = c;
 	/* The last core's, and never this one's: a core that wants it hands it
 	 * over again as it loads the game (mGBA does, in retro_load_game). */
 	g_frame_status = NULL;

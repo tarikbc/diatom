@@ -32,9 +32,16 @@
  * It also exposes a small, entirely predictable block of system RAM, so the
  * achievement path has bytes to watch without an emulator. See sysram below.
  *
+ * And a disc tray with two discs in it, handed over from retro_init the way
+ * pcsx_rearmed hands over its own - once, for the life of the process - so the
+ * frontend's disc control can be tested with no PlayStation core present. It
+ * refuses a disc change with the lid shut, as libretro says a core may, so a
+ * frontend that forgets to open the tray first is caught here. See tray below.
+ *
  * Test fixture. Not part of Diatom's runtime.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -76,7 +83,50 @@ void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_cb = cb
 void retro_set_input_poll(retro_input_poll_t cb)       { poll_cb = cb; }
 void retro_set_input_state(retro_input_state_t cb)     { input_cb = cb; }
 
-void retro_init(void) { frame = 0; }
+/* The tray. Two discs, nothing in them; what is tested is the frontend's
+ * handling of the interface, not anything a disc holds. */
+static bool     tray_open;
+static unsigned tray_disc;
+
+static bool tray_set_eject(bool open)   { tray_open = open; return true; }
+static bool tray_get_eject(void)        { return tray_open; }
+static unsigned tray_get_index(void)    { return tray_disc; }
+static unsigned tray_count(void)        { return 2; }
+static bool tray_set_index(unsigned i)
+{
+	if (!tray_open || i >= 2) return false;
+	tray_disc = i;
+	return true;
+}
+static bool tray_replace(unsigned i, const struct retro_game_info *g)
+{ (void)i; (void)g; return false; }
+static bool tray_add(void)              { return false; }
+static bool tray_initial(unsigned i, const char *path)
+{ (void)i; (void)path; return false; }
+static bool tray_path(unsigned i, char *out, size_t n)
+{ (void)i; (void)out; (void)n; return false; }
+static bool tray_label(unsigned i, char *out, size_t n)
+{
+	if (i >= 2 || !n) return false;
+	snprintf(out, n, "stub disc %u", i + 1);
+	return true;
+}
+
+static struct retro_disk_control_ext_callback tray = {
+	tray_set_eject, tray_get_eject, tray_get_index, tray_set_index,
+	tray_count, tray_replace, tray_add, tray_initial, tray_path, tray_label,
+};
+
+void retro_init(void)
+{
+	unsigned v = 0;
+
+	frame = 0;
+	/* From retro_init and from nowhere else, as pcsx_rearmed does it: a
+	 * resident core never says this again, which is the case worth testing. */
+	if (env && env(RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION, &v) && v >= 1)
+		env(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, &tray);
+}
 void retro_deinit(void) { }
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 
@@ -183,6 +233,9 @@ bool retro_load_game(const struct retro_game_info *game)
 	enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
 	(void)game;                                  /* content is optional here */
 	crash_configure();
+	/* Every game starts on its first disc with the lid shut. */
+	tray_disc = 0;
+	tray_open = false;
 	/* A new game starts at frame zero. The core is resident across games,
 	 * so without this the counter carries over and every fixture built on
 	 * it - the geometry toggle, the crash frame, sysram - means something

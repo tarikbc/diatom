@@ -66,11 +66,12 @@ def check_that(name, cond, got):
     if not cond: fails.append(name)
 
 print("READY:", (r := drain(2.0)))
-check("proto version", [x for x in r if x.startswith("READY")][0].split("\t")[1], "proto=10")
+check("proto version", [x for x in r if x.startswith("READY")][0].split("\t")[1], "proto=11")
 
 # Before any RUN: identity must already be identity, not "everything unbound".
 send("MAP"); check("map is identity while idle", drain(), ["MAP\tmap=identity"])
 send("INPUTS"); check("no labels while idle", drain(), ["INPUTS\tcount=0"])
+send("DISC"); check("no disc while idle", drain(), ["DISC\tcount=0"])
 
 send(f"RUN\tcore={ROOT}/build/desktop/stubcore.so")
 run = drain(3.0)
@@ -167,7 +168,20 @@ check("setlevel refused with no control", drain(), ["ERROR\tcode=bad_level\tmsg=
 
 send("RESET"); check("reset while running", drain(), ["RESETDONE"])
 
+# Discs. The stub hands over a two-disc tray from retro_init, as pcsx_rearmed
+# does, and refuses a change with the lid shut - so SETDISC working at all
+# proves Diatom opened the tray first, and a game reporting it shut afterwards
+# proves Diatom closed it again.
+send("DISC"); check("a game's tray is reported", drain(),
+                    ["DISC\tindex=0\tcount=2\tejected=0\tlabel=stub disc 1"])
+send("SETDISC\tindex=1"); check("SETDISC changes disc and closes the lid", drain(),
+                                ["DISC\tindex=1\tcount=2\tejected=0\tlabel=stub disc 2"])
+send("SETDISC\tindex=2"); check("a disc the game does not have is refused, disc unchanged",
+                                drain(), ["ERROR\tcode=bad_disc\tmsg=2",
+                                          "DISC\tindex=1\tcount=2\tejected=0\tlabel=stub disc 2"])
+
 send("STOP"); print("STOP ->", drain(2.0))
+send("DISC"); check("no disc once the game has stopped", drain(), ["DISC\tcount=0"])
 
 # --- Session persistence over the protocol ---------------------------------
 import tempfile, pathlib
@@ -252,6 +266,10 @@ with open(ovl, "wb") as f:
 
 send(f"RUN\tcore={ROOT}/build/desktop/stubcore.so")
 drain(2.0)
+# Several games into a resident core, which ran retro_init once, at the first.
+# The tray it handed over then has to still be its tray now.
+send("DISC"); check("the tray survives a resident core's later games", drain(),
+                    ["DISC\tindex=0\tcount=2\tejected=0\tlabel=stub disc 1"])
 send(f"OVERLAY\tpath={ovl}\tms=1500"); got = drain(2.0)
 check_that("an overlay is accepted while a game runs", "OVERLAID" in got, got)
 

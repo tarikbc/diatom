@@ -41,6 +41,17 @@ typedef struct {
 	 * again. See diatom_env_pixfmt_settle. */
 	diatom_pixfmt pixfmt;
 	bool          pixfmt_known;
+	/* The core's disc tray, for a game on more than one disc. Kept per core
+	 * for the pixel format's reason: pcsx_rearmed hands it over once, from
+	 * retro_init, and a resident core never runs retro_init again - so a
+	 * single global would belong to whichever core initialized last, and the
+	 * second PlayStation game after a NES game would have no tray at all.
+	 *
+	 * Always the EXT layout. A core that hands over the older interface fills
+	 * its first seven members, which are the same functions in the same
+	 * order, and leaves the last three NULL. */
+	struct retro_disk_control_ext_callback disc;
+	bool          disc_set;
 
 	void   (*set_environment)(retro_environment_t);
 	void   (*set_video_refresh)(retro_video_refresh_t);
@@ -180,6 +191,8 @@ typedef enum {
 	DIATOM_MSG_PREMAP,     /* the launcher has drawn: map the cores now */
 	DIATOM_MSG_LOWBATTERY,   /* report whether the low-battery disc is shown */
 	DIATOM_MSG_SETLOWBATTERY,/* show it over the game, or not: `on`, `blink` */
+	DIATOM_MSG_DISC,       /* report the disc in the tray, and how many */
+	DIATOM_MSG_SETDISC,    /* change to disc `index`, counted from 0 */
 	/* The launcher went away - or was displaced by a newer one, which means
 	 * the same thing. The game keeps running. */
 	DIATOM_MSG_HANGUP
@@ -222,7 +235,8 @@ typedef struct {
 	char dfilter[16];      /* SETDISPLAY: nearest | sharp */
 	int  index, count;     /* SETLEVEL: `count` is POSITIONS, not a max index.
 	                        * OVERLAY: `count` is the duration in ms, sent as
-	                        * `ms=`. One slot, two verbs, no second name. */
+	                        * `ms=`. One slot, two verbs, no second name.
+	                        * SETDISC: `index` is the disc, from 0. */
 } diatom_msg;
 
 /* Input mapping and labels live in env.c, the one layer a remap touches. */
