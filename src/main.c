@@ -409,12 +409,59 @@ static diatom_filter g_filter;
 static long     g_present_frames;
 static uint64_t g_present_us;
 
+/* The frame turned by the game's rotation (SET_ROTATION, see env.c), written
+ * packed into g_frame. Libretro's quarter turns are counter-clockwise: a
+ * source pixel (x, y) in a w x h frame lands at
+ *
+ *   1  (y, w-1-x)        in an h x w frame
+ *   2  (w-1-x, h-1-y)    in a w x h frame
+ *   3  (h-1-y, x)        in an h x w frame
+ *
+ * Walked in DESTINATION order, so the writes are sequential and only the
+ * reads stride; on the A35 the read side is the one the cache forgives. A
+ * vertical CPS frame is 384x224, 86,016 pixels, about the cost of the memcpy
+ * it replaces times a small factor - nothing beside the core's own frame. */
+#define ROTATE_LOOP(T)                                                      \
+	do {                                                                    \
+		const unsigned char *s = data;                                      \
+		T *d = g_frame;                                                     \
+		unsigned dx, dy;                                                    \
+		for (dy = 0; dy < dh; dy++)                                         \
+			for (dx = 0; dx < dw; dx++) {                                   \
+				unsigned sx, sy;                                            \
+				if (rot == 1)      { sx = w - 1 - dy; sy = dx; }            \
+				else if (rot == 2) { sx = w - 1 - dx; sy = h - 1 - dy; }    \
+				else               { sx = dy;         sy = h - 1 - dx; }    \
+				*d++ = ((const T *)(s + (size_t)sy * pitch))[sx];           \
+			}                                                               \
+	} while (0)
+
+static void store_rotated(const void *data, unsigned w, unsigned h,
+                          size_t pitch, unsigned rot)
+{
+	unsigned dw = (rot & 1) ? h : w, dh = (rot & 1) ? w : h;
+
+	if (g_policy.pixfmt == DIATOM_PIX_RGB565) {
+		ROTATE_LOOP(uint16_t);
+		g_frame_pitch = (size_t)dw * 2;
+	} else {
+		ROTATE_LOOP(uint32_t);
+		g_frame_pitch = (size_t)dw * 4;
+	}
+	g_frame_w = (int)dw;
+	g_frame_h = (int)dh;
+}
+
 /* Called from inside retro_run. Copy and return; do not present here. */
 void diatom_on_video(const void *data, unsigned w, unsigned h, size_t pitch)
 {
+	unsigned rot = diatom_env_rotation();
 	size_t need;
 
 	if (!data) return;          /* dupe: keep the previous frame */
+	/* A turned frame is stored packed, which is never more than pitch * h,
+	 * so one size covers both and the buffer still only grows - the frame
+	 * loop allocates nothing once it has seen its largest frame. */
 	need = pitch * h;
 	if (need > g_frame_cap) {
 		void *p = realloc(g_frame, need);
@@ -422,10 +469,14 @@ void diatom_on_video(const void *data, unsigned w, unsigned h, size_t pitch)
 		g_frame = p;
 		g_frame_cap = need;
 	}
-	memcpy(g_frame, data, need);
-	g_frame_w = (int)w;
-	g_frame_h = (int)h;
-	g_frame_pitch = pitch;
+	if (rot) {
+		store_rotated(data, w, h, pitch, rot);
+	} else {
+		memcpy(g_frame, data, need);
+		g_frame_w = (int)w;
+		g_frame_h = (int)h;
+		g_frame_pitch = pitch;
+	}
 	g_frame_fresh = true;
 }
 
@@ -1312,6 +1363,11 @@ static int run_session_inner(const diatom_session *sn)
 	g_base_w      = (int)av.geometry.base_width;
 	g_base_h      = (int)av.geometry.base_height;
 	g_base_aspect = (double)av.geometry.aspect_ratio;
+	/* A vertical arcade game: the rect is for the turned picture. */
+	diatom_env_rotate_dims(&g_base_w, &g_base_h);
+	if (diatom_env_rotation())
+		printf("diatom: turned %u quarter(s) counter-clockwise to %dx%d\n",
+		       diatom_env_rotation(), g_base_w, g_base_h);
 	apply_display(sn->mode, sn->filter);
 	locked_at = 0;
 
