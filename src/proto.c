@@ -194,6 +194,8 @@ static void parse_line(char *line, diatom_msg *out)
 	else if (!strcmp(field, "PREMAP"))     out->kind = DIATOM_MSG_PREMAP;
 	else if (!strcmp(field, "LOWBATTERY"))    out->kind = DIATOM_MSG_LOWBATTERY;
 	else if (!strcmp(field, "SETLOWBATTERY")) out->kind = DIATOM_MSG_SETLOWBATTERY;
+	else if (!strcmp(field, "DISC"))       out->kind = DIATOM_MSG_DISC;
+	else if (!strcmp(field, "SETDISC"))    out->kind = DIATOM_MSG_SETDISC;
 	else {
 		log_(DIATOM_LOG_WARN, "proto: ignoring unknown verb '%s'", field);
 		out->kind = DIATOM_MSG_NONE;
@@ -371,7 +373,11 @@ diatom_msg_kind diatom_proto_poll(diatom_msg *out, int timeout_ms, bool running)
 		/* proto=10 adds low battery. Additive: an old Diatom ignores
 		 * SETLOWBATTERY and a game shows nothing, as before; bumped so a
 		 * launcher can tell whether the disc will be drawn. */
-		diatom_proto_send("READY\tproto=10\tstate=%s", running ? "running" : "idle");
+		/* proto=11 adds discs. Additive: an old Diatom ignores DISC and
+		 * SETDISC, and a launcher that sees proto=10 knows not to offer a
+		 * "Next disc" row that would do nothing - which a player stuck at
+		 * "insert disc 2" could not tell from a disc that would not read. */
+		diatom_proto_send("READY\tproto=11\tstate=%s", running ? "running" : "idle");
 		/* A displaced launcher is a vanished one, and every loop already
 		 * knows what that means - the in-game menu resumes the game. Said
 		 * after READY, so the new launcher hears where things stand first. */

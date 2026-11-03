@@ -23,6 +23,7 @@ differences matter to anyone shipping an image.
 | `mgba` | MPLv2.0 | 3280408 | `abde7a0764f08fa0cc2c7d3d9a29b9d1245a9f3b7df0e7a594b74df642ee53c6` |
 | `genesis_plus_gx` | Non-commercial | 12589216 | `3673a22b906509461e23a5a118b1d1bec15cbda105f260cbcbc08a16b2124e48` |
 | `mednafen_pce_fast` | GPLv2 | 4465432 | `aca90a14b18108c86398da2267ef40d5145eaddbc1c1b310614d745b258552b1` |
+| `pcsx_rearmed` | GPLv2 | 1761648 | `07cb263f1af645ea60906dbdc8d00ba32cd735bde60cf7d8fbc210118e169808` |
 
 Each core also reports its own name and version, which diatom logs at
 load and which usually carries an upstream git hash. Those strings are

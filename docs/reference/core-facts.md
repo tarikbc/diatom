@@ -24,6 +24,17 @@ and aspect, so one row per system cannot be correct.
 | Master System | `genesis_plus_gx` | `3673a22b9065` | 256x192 | 284x240 | 1.5238 | 59.9227 | 44100 |
 | Game Gear | `genesis_plus_gx` | `3673a22b9065` | 160x144 | 284x240 | 1.3333 | 59.9227 | 44100 |
 | PC Engine | `mednafen_pce_fast` | `aca90a14b181` | 256x240 | 512x243 | 1.2150 | 59.8200 | 44100 |
+| PlayStation (NTSC) | `pcsx_rearmed` | `07cb263f1af6` | 256x240 | 1024x512 | 1.3333 | 60.0000 | 44100 |
+
+**The PlayStation row is the exception to the line above.** It was measured
+2026-11-03 from the pinned bytes, but in a linux/arm64 Debian container on the
+build Mac, not on a device: these are the core's own answers to
+`retro_get_system_av_info`, which do not depend on the machine, and they are
+to be measured again on the Pixel 2. The base is what the core reports at
+load; every game run (Metal Gear Solid, Tony Hawk's Pro Skater 2, Peter Pan)
+changed it to 640x480 at frame 1, and a PlayStation game picks its own mode
+from 256 to 640 wide as it goes, so no single base describes the system. PAL
+content was not measured.
 
 ## Pinned set at time of measurement
 
@@ -36,4 +47,5 @@ aging every measurement that cited it.
 - `genesis_plus_gx` `3673a22b906509461e23a5a118b1d1bec15cbda105f260cbcbc08a16b2124e48`
 - `mednafen_pce_fast` `aca90a14b18108c86398da2267ef40d5145eaddbc1c1b310614d745b258552b1`
 - `mgba` `abde7a0764f08fa0cc2c7d3d9a29b9d1245a9f3b7df0e7a594b74df642ee53c6`
+- `pcsx_rearmed` `07cb263f1af645ea60906dbdc8d00ba32cd735bde60cf7d8fbc210118e169808`
 - `snes9x2010` `3933890f520abb9dbb0e5276460785b20ce54d25f552b369cafeca270b9dd44c`
