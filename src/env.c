@@ -32,6 +32,37 @@ void diatom_env_suppress(uint32_t mask)
 	g_suppress = mask;
 }
 
+/* The game's rotation, in quarter turns counter-clockwise, as SET_ROTATION
+ * gave it. A core says it while loading a game, and a resident core loads
+ * many: the last game's answer must not turn the next one, so it is cleared
+ * before every load (diatom_core_start), and a game that never asks runs
+ * upright. */
+static unsigned g_rotation;
+
+void diatom_env_rotation_begin(void)
+{
+	g_rotation = 0;
+}
+
+unsigned diatom_env_rotation(void)
+{
+	return g_rotation;
+}
+
+/* A core describes its geometry in the buffer's own terms, before the turn:
+ * a vertical CPS game is 384x224. What reaches the screen is 224x384, and
+ * every rect is computed from that. The aspect is NOT swapped: FinalBurn
+ * Neo already reports the turned picture's (3:4 for a vertical game), and
+ * RetroArch, which it is written against, applies it to the turned picture. */
+void diatom_env_rotate_dims(int *w, int *h)
+{
+	if (g_rotation & 1) {
+		int t = *w;
+		*w = *h;
+		*h = t;
+	}
+}
+
 bool diatom_env_geometry_changed(void)
 {
 	bool v = g_geometry_dirty;
@@ -46,8 +77,9 @@ bool diatom_env_new_geometry(int *w, int *h, double *aspect)
 	if (g_new_w <= 0 || g_new_h <= 0) return false;
 	*w = g_new_w;
 	*h = g_new_h;
+	diatom_env_rotate_dims(w, h);
 	*aspect = g_new_aspect > 0.0 ? g_new_aspect
-	                             : (double)g_new_w / (double)g_new_h;
+	                             : (double)*w / (double)*h;
 	return true;
 }
 
@@ -221,12 +253,29 @@ static bool env_cb(unsigned cmd, void *data)
 	case MASK(RETRO_ENVIRONMENT_GET_CAN_DUPE):
 		*(bool *)data = true;
 		return true;
-	case MASK(RETRO_ENVIRONMENT_SET_ROTATION):
-		/* Declined by default - the port already owns panel rotation, and
-		 * honoring this would mean rotation twice over. Logged so we find out
-		 * if the assumption is wrong. */
-		diatom_port_log(DIATOM_LOG_INFO, "core asked for SET_ROTATION; declined");
-		return false;
+	case MASK(RETRO_ENVIRONMENT_SET_ROTATION): {
+		/* Honored, and done here in software: diatom_on_video turns each
+		 * frame before the port sees it. It was declined until 2026-11-03
+		 * on the theory that the port already owns rotation and this would
+		 * turn the picture twice. The two are different turns: the port's
+		 * is the PANEL's, mounted sideways in the case, and is the same for
+		 * every game; this one is the GAME's, a monitor stood on its side
+		 * in the cabinet, and differs per game. They compose.
+		 *
+		 * The assumption failed on the first arcade core. FinalBurn Neo
+		 * draws a vertical game (1941, 19XX, Progear) into its native
+		 * sideways buffer, 384x224, asks for rotation 1 and has no fallback
+		 * when refused: the game came up lying on its side. RetroArch turns
+		 * it the same way, which is what the core is written against. */
+		unsigned r = data ? *(const unsigned *)data : 0;
+		char msg[64];
+
+		if (r > 3) return false;
+		g_rotation = r;
+		snprintf(msg, sizeof msg, "rotation %u (x90 counter-clockwise)", r);
+		diatom_port_log(DIATOM_LOG_INFO, msg);
+		return true;
+	}
 
 	/* ---- audio ---------------------------------------------------------- */
 	case MASK(RETRO_ENVIRONMENT_GET_TARGET_SAMPLE_RATE):
@@ -246,12 +295,33 @@ static bool env_cb(unsigned cmd, void *data)
 	}
 
 	/* ---- paths - supplied by the host, never by the port ----------------- */
-	case MASK(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY):
-		*(const char **)data = g_policy->system_dir;
-		return g_policy->system_dir != NULL;
-	case MASK(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY):
-		*(const char **)data = g_policy->save_dir;
-		return g_policy->save_dir != NULL;
+	/* Handed out of buffers of Diatom's own, PATH_MAX long and zero past the
+	 * string, never as the caller's pointer. FinalBurn Neo copies the answer
+	 * with memcpy(g_save_dir, dir, sizeof g_save_dir) - a fixed MAX_PATH
+	 * bytes, however long the string is - and the policy's pointers are argv
+	 * strings, which sit near the top of the stack. When little environment
+	 * followed them the copy read off the end of the stack: every FBNeo load
+	 * segfaulted in a container started with a short environment, measured
+	 * 2026-11-03, and the same build loaded fine with one more variable set.
+	 * A launcher's environment is not something to rest that on. */
+	case MASK(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY): {
+		static char dir[4096];
+
+		if (!g_policy->system_dir) return false;
+		memset(dir, 0, sizeof dir);
+		snprintf(dir, sizeof dir, "%s", g_policy->system_dir);
+		*(const char **)data = dir;
+		return true;
+	}
+	case MASK(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY): {
+		static char dir[4096];
+
+		if (!g_policy->save_dir) return false;
+		memset(dir, 0, sizeof dir);
+		snprintf(dir, sizeof dir, "%s", g_policy->save_dir);
+		*(const char **)data = dir;
+		return true;
+	}
 
 	/* ---- core options ---------------------------------------------------- */
 	case MASK(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION):

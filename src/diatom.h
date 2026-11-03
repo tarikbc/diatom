@@ -93,6 +93,11 @@ void diatom_env_bind(diatom_core *c, diatom_policy *p, diatom_port_caps *caps);
  * time. */
 void diatom_env_pixfmt_begin(void);
 void diatom_env_pixfmt_settle(diatom_core *c);
+/* The game's own rotation (SET_ROTATION), cleared before every load. See
+ * env.c; main.c turns the frames and the geometry by it. */
+void diatom_env_rotation_begin(void);
+unsigned diatom_env_rotation(void);
+void diatom_env_rotate_dims(int *w, int *h);
 bool diatom_env_geometry_changed(void);
 bool diatom_env_new_geometry(int *w, int *h, double *aspect);   /* consumes the flag */
 
