@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -46,6 +47,7 @@
 
 #include "diatom_port.h"
 #include "ladder.h"
+#include "osdbar.h"
 #include "port_clock.h"
 #include "port_cpufreq.h"
 
@@ -131,7 +133,7 @@ static bool g_present_debug;
 
 /* GL objects, all owned by the thread. */
 static GLuint g_prog_plain, g_prog_sharp, g_prog_solid;
-static GLuint g_frame_tex, g_overlay_tex;
+static GLuint g_frame_tex, g_overlay_tex, g_osdbar_tex;
 static int    g_tex_w = -1, g_tex_h = -1;
 static diatom_pixfmt g_tex_fmt;
 
@@ -145,7 +147,10 @@ static int            g_ov_w, g_ov_h;
 static uint64_t       g_ov_until;
 static bool           g_ov_dirty;           /* a new image to upload */
 
-static uint64_t g_osd_until;
+/* The level bar: when it came up and when it last changed, which is all its
+ * slide and fade need (osdbar_envelope). */
+static uint64_t g_osd_shown, g_osd_changed;
+static bool     g_osd_on;
 static int      g_osd_level, g_osd_max, g_osd_kind;   /* kind 0 volume, 1 brightness */
 static bool     g_lowbat, g_lowbat_blink;   /* the low-battery disc; under g_mx */
 
@@ -413,10 +418,19 @@ static void gain_jack_poll(void)
 static void osd_show(int kind, int level, int max)
 {
 	pthread_mutex_lock(&g_mx);
+	uint64_t now = diatom_port_now_us();
+	float a, rise;
+
+	/* Coming in only when it was not already up: a press while it holds or
+	 * fades keeps it where it is, as on the shelf. */
+	if (!g_osd_on || !osdbar_envelope((uint32_t)((now - g_osd_shown) / 1000),
+	                                  (uint32_t)((now - g_osd_changed) / 1000), &a, &rise))
+		g_osd_shown = now;
+	g_osd_on    = true;
 	g_osd_kind  = kind;
 	g_osd_level = level;
 	g_osd_max   = max;
-	g_osd_until = diatom_port_now_us() + 1500000ull;
+	g_osd_changed = now;
 	pthread_mutex_unlock(&g_mx);
 }
 
@@ -641,23 +655,39 @@ static void upload_frame(const mailbox_frame *f)
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 }
 
-/* The level bar, the Brick's design so it reads the same on both devices and
- * on the shelf: a scrim across the top of the surface with a 6 px bar in it,
- * in the launcher's two colors. Blended, so "halve what is there" is black at
- * half alpha. */
-static void draw_level_bar(int kind, int level, int max, bool turned)
+/* The level bar: the launcher's own pill, from the same code (osdbar.c, which
+ * is TortOS's src/osdbar.c), so a volume press looks the same in a game as on
+ * the shelf and over a port. Drawn into pixels at the surface's scale - 0.625
+ * of the launcher's 1024 on the 640x480 panel - and redrawn only when the
+ * level or the fade moves; the slide is the quad's place. BGRA with straight
+ * alpha, the overlay's own layout, so it goes up the overlay's way. Not
+ * through the panel's color matrix: the shelf is not, and the bar is the
+ * shelf's. */
+static void draw_level_bar(int kind, int level, int max, float alpha, float rise,
+                           bool turned)
 {
-	const float pad = 3, bar = 6, W = (float)g_surface_w;
-	float fill = (level < 0 || max <= 0) ? 0 : W * (float)level / (float)max;
+	static uint32_t px[OSDBAR_W * OSDBAR_H];
+	static int drawn_kind = -1, drawn_level, drawn_max, drawn_a, w, h;
+	const float s = (float)g_surface_w / 1024.0f;
+	int a = (int)(alpha * 255 + 0.5f);
 
-	solid(0, 0, W, pad, 0, 0, 0, 0.5f, turned);
-	solid(0, pad + bar, W, pad, 0, 0, 0, 0.5f, turned);
-	if (fill > 0) {
-		if (kind) solid(0, pad, fill, bar, 255 / 255.f, 206 / 255.f, 128 / 255.f, 1, turned);
-		else      solid(0, pad, fill, bar,  61 / 255.f, 214 / 255.f, 255 / 255.f, 1, turned);
+	if (s <= 0 || s > 1) return;
+	if (kind != drawn_kind || level != drawn_level || max != drawn_max || a != drawn_a) {
+		osdbar_size(s, &w, &h);
+		osdbar_render(px, w, h, w, s, kind ? OSDBAR_BRIGHT : OSDBAR_VOLUME,
+		              level, max, alpha, false);
+		glBindTexture(GL_TEXTURE_2D, g_osdbar_tex);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+		drawn_kind = kind; drawn_level = level; drawn_max = max; drawn_a = a;
 	}
-	if (fill < W)
-		solid(fill, pad, W - fill, bar, 60 / 255.f, 62 / 255.f, 72 / 255.f, 1, turned);
+	glBindTexture(GL_TEXTURE_2D, g_osdbar_tex);
+	glUseProgram(g_prog_plain);
+	glUniform1i(glGetUniformLocation(g_prog_plain, "u_tex"), 0);
+	glUniform2f(glGetUniformLocation(g_prog_plain, "u_size"), (float)w, (float)h);
+	glUniform1i(glGetUniformLocation(g_prog_plain, "u_panel"), 0);
+	draw_quad(roundf(OSDBAR_X * s), roundf((OSDBAR_Y - rise) * s), (float)w, (float)h,
+	          (float)w, (float)h, turned);
 }
 
 /* The low-battery disc: the launcher's, in its place and color, as horizontal
@@ -724,7 +754,8 @@ static void matrix_load(void)
 
 /* Draw one frame and whatever is over it, onto the current target. */
 static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
-                       int osd_kind, int osd_level, int osd_max, bool lowbat,
+                       int osd_kind, int osd_level, int osd_max,
+                       float osd_alpha, float osd_rise, bool lowbat,
                        bool turned)
 {
 	GLuint prog = f->filter == DIATOM_FILTER_SHARP ? g_prog_sharp : g_prog_plain;
@@ -793,7 +824,7 @@ static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
 		          (float)g_ov_w, (float)g_ov_h, turned);
 	}
 	if (osd_live)
-		draw_level_bar(osd_kind, osd_level, osd_max, turned);
+		draw_level_bar(osd_kind, osd_level, osd_max, osd_alpha, osd_rise, turned);
 	if (lowbat)
 		draw_low_battery(turned);
 	glDisable(GL_BLEND);
@@ -1015,11 +1046,20 @@ static bool gl_start(void)
 
 	glGenTextures(1, &g_frame_tex);
 	glGenTextures(1, &g_overlay_tex);
+	glGenTextures(1, &g_osdbar_tex);
 	glBindTexture(GL_TEXTURE_2D, g_frame_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	/* The overlay is BGRA straight alpha, uploaded as bytes: swizzled back. */
 	glBindTexture(GL_TEXTURE_2D, g_overlay_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+	/* The level bar: the same, BGRA straight alpha (draw_level_bar). */
+	glBindTexture(GL_TEXTURE_2D, g_osdbar_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1066,7 +1106,7 @@ static bool capture_front(int front, const char *path)
 	glViewport(0, 0, g_surface_w, g_surface_h);
 
 	upload_frame(&g_frames[front]);
-	draw_scene(&g_frames[front], false, false, 0, 0, 0, false, false);
+	draw_scene(&g_frames[front], false, false, 0, 0, 0, 0, 0, false, false);
 	glReadPixels(0, 0, g_surface_w, g_surface_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1104,6 +1144,7 @@ static void *present_thread(void *arg)
 		int frame;
 		bool ov_live, osd_live, lowbat;
 		int osd_kind, osd_level, osd_max;
+		float osd_alpha = 0, osd_rise = 0;
 		uint64_t now, t0 = 0;
 
 		if (g_pending < 0 && !g_want_blank && !g_capture_path) {
@@ -1154,7 +1195,11 @@ static void *present_thread(void *arg)
 			             GL_RGBA, GL_UNSIGNED_BYTE, g_ov);
 			g_ov_dirty = false;
 		}
-		osd_live  = now < g_osd_until;
+		osd_live  = g_osd_on &&
+		            osdbar_envelope((uint32_t)((now - g_osd_shown) / 1000),
+		                            (uint32_t)((now - g_osd_changed) / 1000),
+		                            &osd_alpha, &osd_rise);
+		if (!osd_live) g_osd_on = false;
 		osd_kind  = g_osd_kind;
 		osd_level = g_osd_level;
 		osd_max   = g_osd_max;
@@ -1165,7 +1210,7 @@ static void *present_thread(void *arg)
 		if (g_present_debug) t0 = diatom_port_now_us();
 		upload_frame(&g_frames[frame]);
 		draw_scene(&g_frames[frame], ov_live, osd_live, osd_kind, osd_level,
-		           osd_max, lowbat, g_turned);
+		           osd_max, osd_alpha, osd_rise, lowbat, g_turned);
 		eglSwapBuffers(g_egl_display, g_egl_surface);
 		if (g_present_debug) {
 			static int n;
