@@ -665,7 +665,7 @@ static void upload_frame(const mailbox_frame *f)
 }
 
 /* The level bar: the launcher's own pill, from the same code (osdbar.c, which
- * is TortOS's src/osdbar.c), so a volume press looks the same in a game as on
+ * is ZyperOS's src/osdbar.c), so a volume press looks the same in a game as on
  * the shelf and over a port. Drawn into pixels at the surface's scale - 0.625
  * of the launcher's 1024 on the 640x480 panel - and redrawn only when the
  * level, the fade or the theme moves; the slide is the quad's place. BGRA

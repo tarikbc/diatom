@@ -94,7 +94,7 @@ ifeq ($(PORT),pixel2)
   # with libdrm for the display.
   PKG_CONFIG ?= pkg-config
   PIXEL2_PKGS := sdl2 egl glesv2 gbm libdrm
-  # The level bar, TortOS's own drawing of it (port/osdbar.c), and the theme
+  # The level bar, ZyperOS's own drawing of it (port/osdbar.c), and the theme
   # file the launcher writes for it to read (port/themefile.c)
   SRC += port/osdbar.c port/themefile.c
   CFLAGS  += $(shell $(PKG_CONFIG) --cflags $(PIXEL2_PKGS))

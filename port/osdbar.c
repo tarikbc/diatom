@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/osdbar.c at f972dad, which is where it is changed:
+/* Vendored from ZyperOS src/osdbar.c at f972dad, which is where it is changed:
  * the launcher, this port and portkeys draw the same bar from the same code. Copy
  * it back here whole when it changes there. */
 /* The volume and brightness bar's pixels. See src/osdbar.h. */

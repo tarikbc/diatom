@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/osdbar.h at f972dad, which is where it is changed:
+/* Vendored from ZyperOS src/osdbar.h at 39590d7, which is where it is changed:
  * the launcher, this port and portkeys draw the same bar from the same code. Copy
  * it back here whole when it changes there. */
-#ifndef TORTOS_OSDBAR_H
-#define TORTOS_OSDBAR_H
+#ifndef ZYPEROS_OSDBAR_H
+#define ZYPEROS_OSDBAR_H
 
 /* The volume and brightness bar, as pixels: one drawing for every place it
  * shows, so it is the same thing on the shelf, in a Diatom game and over a
@@ -25,16 +25,16 @@
  * Why pixels and not SDL draws: two of the three places have no SDL. Diatom
  * draws its overlay with GLES, and portkeys has only a KMS buffer on the
  * panel's cursor layer while a port owns the display. All three take this
- * function's output as it is - TortOS as a texture, Diatom as a GL
+ * function's output as it is - ZyperOS as a texture, Diatom as a GL
  * texture, portkeys straight into the scanout buffer, turned for the panel -
  * so the design is written down once. Plain C, no allocation the
  * caller does not see, nothing but libm.
  *
- * Under either license above: TortOS is GPL and Diatom, which carries a copy
+ * Under either license above: ZyperOS is GPL and Diatom, which carries a copy
  * of these two files in its port/, with src/design.h they read, is MPL.
  *
  * The geometry is in DESIGN UNITS, the launcher's 1024x768 drawing space,
- * and `scale` is output pixels per unit: 1 for TortOS, 0.625 for the Pixel 2's
+ * and `scale` is output pixels per unit: 1 for ZyperOS, 0.625 for the Pixel 2's
  * 640x480 panel. Every edge is antialiased from its distance to the pixel's
  * center, so it is as crisp at 0.625 as at 1. */
 

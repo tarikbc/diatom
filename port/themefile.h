@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/themefile.h at 65f3f90, which is where it is changed:
+/* Vendored from ZyperOS src/themefile.h at 65f3f90, which is where it is changed:
  * the launcher writes the theme file and this port and portkeys read it with the
  * same code. Copy it back here whole when it changes there. */
 #ifndef ZYPEROS_THEMEFILE_H
