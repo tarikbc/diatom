@@ -220,6 +220,7 @@ bool diatom_port_init(diatom_port_caps *out)
 	out->audio_rate         = AUDIO_RATE;
 	out->audio_buffer_frames = AUDIO_BUFFER_FRAMES;   /* open or not yet */
 	out->present_blocks     = false;
+	out->gpu                = false;
 	return true;
 }
 
@@ -580,3 +581,14 @@ void diatom_port_mute_set(bool on) { g_muted = on; }
 bool diatom_port_mute_get(void) { return g_muted; }
 void diatom_port_fast_clock(bool on) { (void)on; }
 void diatom_port_power(int level) { (void)level; }
+
+/* No GPU frames on the desktop yet: its window is an SDL renderer's, and a
+ * core that asks for the GPU is refused (see diatom_port.h). */
+bool      diatom_port_gpu_begin(const diatom_gpu_spec *spec) { (void)spec; return false; }
+void      diatom_port_gpu_end(void) {}
+uintptr_t diatom_port_gpu_target(void) { return 0; }
+void     *diatom_port_gpu_proc(const char *name) { (void)name; return NULL; }
+void      diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter)
+{ (void)w; (void)h; (void)dst; (void)filter; }
+bool      diatom_port_gpu_read(void *xrgb, int *w, int *h, size_t cap)
+{ (void)xrgb; (void)w; (void)h; (void)cap; return false; }

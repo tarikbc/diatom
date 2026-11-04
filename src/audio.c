@@ -19,6 +19,7 @@
  * (measured: 50.0070 PAL, 59.7275, 59.8200, 60.0000), so a fixed ratio drifts
  * against the panel forever and eventually underruns or overflows.
  */
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -237,7 +238,7 @@ static int      g_in_peak;
 static uint64_t g_in_nonzero, g_in_total;
 static double   g_in_sq;
 
-void diatom_audio_note_input(const int16_t *f, size_t n)
+static void note_input(const int16_t *f, size_t n)
 {
 	if (g_tap_in) fwrite(f, sizeof(int16_t) * 2, n, g_tap_in);
 	size_t i;
@@ -264,7 +265,7 @@ uint64_t diatom_audio_samples(void) { return g_total; }
 
 uint64_t diatom_audio_dropped(void) { return g_dropped; }
 
-void diatom_audio_configure(double src_rate, int dst_rate, int capacity_frames)
+static void configure(double src_rate, int dst_rate, int capacity_frames)
 {
 	/* A session starts where quiet already is, with no fade: the launcher
 	 * sends it before RUN, so a game started during the music is silent from
@@ -324,7 +325,7 @@ void diatom_audio_configure(double src_rate, int dst_rate, int capacity_frames)
  * Priming with silence costs one buffer of latency at startup, which is the
  * latency we were going to have anyway once the buffer filled.
  */
-void diatom_audio_prime(void)
+static void prime(void)
 {
 	int16_t silence[512 * 2];
 	int remaining = g_capacity / 2;
@@ -349,7 +350,7 @@ void diatom_audio_prime(void)
  * closes the loop, and it is why the port must expose capacity and not just
  * occupancy.
  */
-void diatom_audio_sync(void)
+static void sync_rate(void)
 {
 	double target, delta, adjust;
 	size_t queued;
@@ -447,7 +448,7 @@ static int16_t clip(double v)
 	return (int16_t)(v > 0 ? v + 0.5 : v - 0.5);
 }
 
-size_t diatom_audio_push(const int16_t *in, size_t frames)
+static size_t push_input(const int16_t *in, size_t frames)
 {
 	int16_t out[OUT_CHUNK * 2];
 	size_t produced = 0, total = 0;
@@ -459,7 +460,7 @@ size_t diatom_audio_push(const int16_t *in, size_t frames)
 	 * Nothing observed emits more than ~1100 frames at once - mGBA's 65536 Hz
 	 * over one frame is the worst - but a core is free to. */
 	while (frames > MAX_IN) {
-		total += diatom_audio_push(in, MAX_IN);
+		total += push_input(in, MAX_IN);
 		in    += MAX_IN * 2;
 		frames -= MAX_IN;
 	}
@@ -519,4 +520,49 @@ size_t diatom_audio_push(const int16_t *in, size_t frames)
 
 	if (produced) { push(out, produced); total += produced; }
 	return total;
+}
+
+/* One at a time. The frame loop was the only caller until a core made its
+ * sound on a thread of its own (flycast2021's emulation thread, see
+ * diatom_on_audio_batch_store), which now pushes from there while the loop
+ * keeps the rate in step: everything that writes this file's state takes the
+ * lock. The figures read for the summary are read without it. */
+static pthread_mutex_t g_audio_mx = PTHREAD_MUTEX_INITIALIZER;
+
+void diatom_audio_note_input(const int16_t *f, size_t n)
+{
+	pthread_mutex_lock(&g_audio_mx);
+	note_input(f, n);
+	pthread_mutex_unlock(&g_audio_mx);
+}
+
+void diatom_audio_configure(double src_rate, int dst_rate, int capacity_frames)
+{
+	pthread_mutex_lock(&g_audio_mx);
+	configure(src_rate, dst_rate, capacity_frames);
+	pthread_mutex_unlock(&g_audio_mx);
+}
+
+void diatom_audio_prime(void)
+{
+	pthread_mutex_lock(&g_audio_mx);
+	prime();
+	pthread_mutex_unlock(&g_audio_mx);
+}
+
+void diatom_audio_sync(void)
+{
+	pthread_mutex_lock(&g_audio_mx);
+	sync_rate();
+	pthread_mutex_unlock(&g_audio_mx);
+}
+
+size_t diatom_audio_push(const int16_t *in, size_t frames)
+{
+	size_t n;
+
+	pthread_mutex_lock(&g_audio_mx);
+	n = push_input(in, frames);
+	pthread_mutex_unlock(&g_audio_mx);
+	return n;
 }

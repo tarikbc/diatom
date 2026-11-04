@@ -213,8 +213,34 @@ static int          g_nplanes;
  * preview is that rect's picture, composed (scr_compose) - the in-game menu
  * then sits over what the player was looking at, not over a tall strip
  * squeezed into the wrong box. Once per pause and once at exit. */
+/* A GPU frame (hw.c) is no pixels until asked: read back into g_frame as
+ * XRGB8888, top row first, for a preview. Once per pause and once at exit,
+ * like the preview itself, so the cost of the read never reaches a frame. */
+static bool gpu_snapshot(void)
+{
+	size_t need = (size_t)g_frame_w * (size_t)g_frame_h * 4;
+	int w = 0, h = 0;
+
+	if (need == 0) return false;
+	if (need > g_frame_cap) {
+		void *p = realloc(g_frame, need);
+		if (!p) return false;
+		g_frame = p;
+		g_frame_cap = need;
+	}
+	if (!diatom_port_gpu_read(g_frame, &w, &h, g_frame_cap)) return false;
+	g_frame_w = w;
+	g_frame_h = h;
+	g_frame_pitch = (size_t)w * 4;
+	g_policy.pixfmt = DIATOM_PIX_XRGB8888;
+	return true;
+}
+
 static bool write_preview(const char *path)
 {
+	/* No picture rather than the last game's pixels, which g_frame still
+	 * holds while a GPU game draws none of its own */
+	if (diatom_hw_active() && !gpu_snapshot()) return false;
 	if (g_dual && g_nplanes > 0 && g_frame) {
 		int bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4, w = 0, h = 0;
 		void *pic = scr_compose(g_frame, g_frame_pitch, bpp, g_planes, g_nplanes, &w, &h);
@@ -338,12 +364,63 @@ static const struct {
 	{ SIGABRT, "EXIT\treason=crash\tsignal=SIGABRT\n", "ERROR\tcode=crash\tmsg=SIGABRT\n" },
 };
 
+/* Where it died, for whoever reads the log: the faulting address, the
+ * instruction, and the executable mappings to place it in a library. All of
+ * it with write(), open() and read(), which are async-signal-safe; formatting
+ * is by hand for the same reason. A crash that came with nothing but its
+ * signal's name (flycast2021 leaving a game, SIGBUS, 2026-11-04) is what this
+ * is for. */
+static void crash_hex(const char *label, uintptr_t v)
+{
+	char buf[64];
+	size_t n = 0, i;
+	int shift;
+
+	for (i = 0; label[i] && n < 40; i++) buf[n++] = label[i];
+	buf[n++] = '0';
+	buf[n++] = 'x';
+	for (shift = (int)sizeof v * 8 - 4; shift >= 0; shift -= 4)
+		buf[n++] = "0123456789abcdef"[(v >> shift) & 15];
+	buf[n++] = '\n';
+	if (write(2, buf, n) < 0) { /* nothing to do about it here */ }
+}
+
+static void crash_where(siginfo_t *si, void *uc)
+{
+	char chunk[4096], line[512];
+	size_t len = 0;
+	ssize_t got;
+	int fd, i;
+
+	crash_hex("diatom: crash at ", (uintptr_t)si->si_addr);
+	/* glibc's signal.h gives ucontext_t, and its aarch64 registers; Darwin's
+	 * are elsewhere, behind a pointer, and the desktop port builds there */
+#if defined(__linux__) && defined(__aarch64__)
+	crash_hex("diatom: pc ", (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc);
+	crash_hex("diatom: lr ", (uintptr_t)((ucontext_t *)uc)->uc_mcontext.regs[30]);
+#else
+	(void)uc;
+#endif
+	if ((fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC)) < 0) return;
+	while ((got = read(fd, chunk, sizeof chunk)) > 0)
+		for (i = 0; i < got; i++) {
+			if (len < sizeof line - 1) line[len++] = chunk[i];
+			else line[sizeof line - 2] = '\n';   /* cut short, still a line */
+			if (chunk[i] != '\n') continue;
+			/* the executable ones only: "r-xp" at the permissions */
+			if (len > 30 && memchr(line, 'x', len < 40 ? len : 40))
+				if (write(2, line, len) < 0) { /* as above */ }
+			len = 0;
+		}
+	close(fd);
+}
+
 /* Deliberately no diatom_port_present_stop() below. It waits on a condition
  * variable, which is not async-signal-safe, and a crashed game that tears on
  * its way out is a far better outcome than one that deadlocks in a signal
  * handler with the display held. The tear is milliseconds; the deadlock would
  * be a power cycle. */
-static void on_crash(int sig)
+static void on_crash(int sig, siginfo_t *si, void *uc)
 {
 	size_t i;
 
@@ -358,6 +435,10 @@ static void on_crash(int sig)
 				                        : crash_lines[i].loading);
 				break;
 			}
+
+	/* Then where, for the log: after the launcher has heard, since a stalled
+	 * stderr would block these writes. */
+	crash_where(si, uc);
 
 	/* Then die of the original signal with its original disposition. Anything
 	 * else lies about how the process ended: the wait status is how a
@@ -420,8 +501,8 @@ static void install_crash_handlers(void)
 	sigaltstack(&ss, NULL);
 
 	memset(&sa, 0, sizeof sa);
-	sa.sa_handler = on_crash;
-	sa.sa_flags   = SA_ONSTACK;
+	sa.sa_sigaction = on_crash;
+	sa.sa_flags     = SA_ONSTACK | SA_SIGINFO;
 	/* Block everything for the duration: a second fault inside the handler
 	 * then cannot re-enter it, and the kernel kills us outright instead. That
 	 * is the right outcome - it is already the second failure. */
@@ -508,6 +589,14 @@ void diatom_on_video(const void *data, unsigned w, unsigned h, size_t pitch)
 	size_t need;
 
 	if (!data) return;          /* dupe: keep the previous frame */
+	/* Drawn by the GPU into the port's framebuffer (hw.c): no pixels to copy,
+	 * only the size. Not turned: no GPU core here asks for a rotation. */
+	if (data == RETRO_HW_FRAME_BUFFER_VALID) {
+		g_frame_w = (int)w;
+		g_frame_h = (int)h;
+		g_frame_fresh = true;
+		return;
+	}
 	/* A turned frame is stored packed, which is never more than pitch * h,
 	 * so one size covers both and the buffer still only grows - the frame
 	 * loop allocates nothing once it has seen its largest frame. */
@@ -547,8 +636,67 @@ static bool g_audio_warmup;
  * loop pushes silence for the time each fast turn stands for. */
 static bool g_audio_fast;
 
+/* A core that makes its sound on a thread of its own pushes it from there:
+ * flycast2021's threaded rendering does, from its emulation thread. audio.c
+ * takes a lock for it.
+ *
+ * And it is that thread's pace. Nothing else holds it back - RetroArch's
+ * sound write blocks, which is what holds it there - and unheld it ran
+ * Crazy Taxi 2 31% fast, its sound dropped by the second and frames it had
+ * no time to hand over thrown away (2026-11-04). So it waits while the
+ * device's queue is over three quarters full, which holds the game to the
+ * speaker's rate: the queue drains on its own, whatever the frame loop is
+ * doing. (Held to sound the frame loop moved, it waited on a frame that was
+ * waiting on it: 72% of real time.) Never past a bound, so a stopped device
+ * only loses that thread some sound. Not in fast forward, which is meant to
+ * outrun the speaker; the loop pushes silence then. */
+#define FOREIGN_WAIT_US 100000
+#define FOREIGN_POLL_US 2000
+static pthread_t g_host_thread;
+static size_t    g_foreign_high;       /* three quarters of the device's queue; 0 none */
+static volatile bool g_foreign_held = true;   /* false while the core ends its threads */
+/* DIATOM_AUDIO_DEBUG, read on the host's thread as a session configures its
+ * sound: getenv on the core's thread could race a setenv here (AUDIODEV, on
+ * SETAUDIO). */
+static bool      g_foreign_debug;
+
+/* The core's clear-waits callback (env.c): false lets go of a thread held for
+ * the speaker, while the core winds its threads down at unload. */
+void diatom_audio_hold_waits(bool hold)
+{
+	g_foreign_held = hold;
+}
+
+static void foreign_pace(void)
+{
+	unsigned waited = 0;
+
+	if (!g_foreign_high || g_audio_fast || !g_foreign_held) return;
+	while (g_foreign_held && diatom_port_audio_queued() > g_foreign_high &&
+	       waited < FOREIGN_WAIT_US) {
+		usleep(FOREIGN_POLL_US);
+		waited += FOREIGN_POLL_US;
+	}
+}
+
 void diatom_on_audio_batch_store(const int16_t *data, size_t frames)
 {
+	if (!pthread_equal(pthread_self(), g_host_thread)) {
+		foreign_pace();
+		if (g_foreign_debug) {
+			static uint64_t since, got;
+			uint64_t now = diatom_port_now_us();
+
+			got += frames;
+			if (!since) since = now;
+			if (now - since >= 2000000) {
+				printf("diatom: %.0f sound frames a second from the core's thread, queue %zu\n",
+				       got * 1e6 / (double)(now - since), diatom_port_audio_queued());
+				got = 0;
+				since = now;
+			}
+		}
+	}
 	if (g_audio_fast) return;    /* the frame loop pushes silence instead */
 	diatom_audio_note_input(data, frames);
 	if (g_audio_warmup) return;
@@ -719,6 +867,12 @@ static void idle_note_input(bool any)
  * exit summary's figure for stretch, 6.6 to 7.0 ms, rounded up. */
 #define FAST_PRESENT_GUESS_US 7000.0
 static int  g_speed = 1;
+
+/* For a core that asks (GET_FASTFORWARDING, env.c) */
+bool diatom_fast_forwarding(void)
+{
+	return g_speed > 1;
+}
 
 /* A Super Game Boy's clock is the SNES's, 2.4% faster than a Game Boy's, and
  * mGBA, running an SGB-flagged game as one (in the GBC folder, where the model
@@ -1422,6 +1576,10 @@ static void present_frame(bool fresh)
 	int  bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4;
 	bool cur = g_dual && sty_on() && g_frame && g_frame_w > 0;
 
+	if (diatom_hw_active()) {
+		if (fresh) diatom_port_present_gpu(g_frame_w, g_frame_h, g_dst, g_filter);
+		return;
+	}
 	if (cur) sty_stamp(g_frame, g_frame_pitch, bpp, g_frame_w, g_frame_h);
 	diatom_port_present((fresh || cur) ? g_frame : NULL,
 	                    g_frame_w, g_frame_h, g_frame_pitch,
@@ -1606,7 +1764,11 @@ static int run_session_inner(const diatom_session *sn)
 	 * to load is not an error, it just means the game starts normally. That
 	 * fallback is what makes resume-by-default safe across a core update. */
 	diatom_save_init(g_core, g_policy.save_dir, sn->rom);
-	if (sn->state_load && !diatom_state_load(g_core, sn->state_load))
+	/* Not yet for a core that draws with the GPU: flycast2021 runs its
+	 * machine on a thread that starts with the first frame, and refuses a
+	 * state before then, so a game never resumed. Its state goes in after the
+	 * warmup, below. */
+	if (sn->state_load && !diatom_hw_active() && !diatom_state_load(g_core, sn->state_load))
 		printf("diatom: no usable state at %s; starting the game normally\n",
 		       sn->state_load);
 
@@ -1636,8 +1798,14 @@ static int run_session_inner(const diatom_session *sn)
 	if (audio_rate != av.timing.sample_rate)
 		printf("diatom: Super Game Boy timing: resampling from %.0f Hz, "
 		       "not the %.0f Hz announced\n", audio_rate, av.timing.sample_rate);
-	diatom_audio_configure(audio_rate, g_caps.audio_rate,
-	                       diatom_port_audio_start() ? g_caps.audio_buffer_frames : 0);
+	{
+		int cap = diatom_port_audio_start() ? g_caps.audio_buffer_frames : 0;
+
+		diatom_audio_configure(audio_rate, g_caps.audio_rate, cap);
+		g_foreign_high = (size_t)cap * 3 / 4;
+		g_foreign_held = true;
+		g_foreign_debug = getenv("DIATOM_AUDIO_DEBUG") != NULL;
+	}
 	diatom_audio_prime();
 
 	/* The rect is computed from BASE geometry and does not move again unless
@@ -1768,14 +1936,20 @@ static int run_session_inner(const diatom_session *sn)
 		g_audio_warmup = true;
 		for (w = 0; w < 3; w++) {
 			g_core->run();
-			diatom_port_present(g_frame, g_frame_w, g_frame_h, g_frame_pitch,
-			                    g_policy.pixfmt, g_dst,
-			                    g_filter);
+			if (diatom_hw_active())
+				present_frame(g_frame_fresh);
+			else
+				diatom_port_present(g_frame, g_frame_w, g_frame_h, g_frame_pitch,
+				                    g_policy.pixfmt, g_dst,
+				                    g_filter);
 		}
 		g_audio_warmup = false;
 		printf("diatom: warmup 3 frames in %.1f ms\n",
 		       (diatom_port_now_us() - w0) / 1000.0);
 	}
+	if (sn->state_load && diatom_hw_active() && !diatom_state_load(g_core, sn->state_load))
+		printf("diatom: no usable state at %s; starting the game normally\n",
+		       sn->state_load);
 
 	t_start = diatom_port_now_us();
 	next_us = (double)t_start;
@@ -2407,6 +2581,8 @@ static int run_session(const diatom_session *sn)
 int main(int argc, char **argv)
 {
 	const char *core_path = NULL, *rom_path = NULL, *shot_path = NULL;
+
+	g_host_thread = pthread_self();
 	/* Stretch by default, judged on the panel. A handheld's screen
 	 * is its whole interface, and full use of it beat both the letterbox and
 	 * the crop. nearest because sharp earned nothing visible at these factors

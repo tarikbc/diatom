@@ -60,6 +60,7 @@ typedef struct {
 	int  audio_rate;            /* what the device actually runs at */
 	int  audio_buffer_frames;   /* capacity; DRC needs this, not just queued */
 	bool present_blocks;        /* does present() wait for vblank? */
+	bool gpu;                   /* can draw a core's GPU frames (diatom_port_gpu_begin) */
 } diatom_port_caps;
 
 /* Canonical Diatom buttons. Digital only, no analog axes anywhere.
@@ -175,6 +176,43 @@ typedef enum {
 } diatom_park;
 
 void diatom_port_present_stop(diatom_park park);
+
+/* Frames drawn by the GPU: a core that renders with OpenGL ES draws into a
+ * framebuffer the port owns instead of handing over pixels. Pixels would mean
+ * reading every frame back from the GPU and uploading it again, which on the
+ * Pixel 2's Mali-G31 costs more than the frame; a Dreamcast is not playable
+ * any other way here.
+ *
+ * Still pixels and time, not cores: the port hands out a GL context, a
+ * framebuffer name and function pointers, and libretro's half of the bargain
+ * (SET_HW_RENDER, context_reset) is the host's. A port with no GPU of its own
+ * returns false from begin, and the host refuses such a core cleanly.
+ *
+ * Every call but present_gpu's queueing happens on the host's thread, the one
+ * that runs the core: begin makes the core's context current THERE and it
+ * stays current until end. */
+typedef struct {
+	int  major;             /* the OpenGL ES version asked for: 2 or 3 */
+	int  max_w, max_h;      /* the largest frame the core will draw */
+	bool depth, stencil;
+	bool top_down;          /* its first row at the top, not GL's way up */
+} diatom_gpu_spec;
+
+bool  diatom_port_gpu_begin(const diatom_gpu_spec *spec);
+void  diatom_port_gpu_end(void);
+/* The framebuffer to draw into, as a GL name: always the same one, with the
+ * frame's own texture put under it here. The host calls it before every
+ * frame, since a core may read the name once and keep it; a core may also
+ * ask as often as it likes. */
+uintptr_t diatom_port_gpu_target(void);
+void *diatom_port_gpu_proc(const char *name);
+/* The frame just drawn: w x h at the framebuffer's bottom-left corner, GL's
+ * way up (bottom row first) unless the spec said top_down. Shown like a
+ * present's, into `dst`. */
+void  diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter);
+/* The last frame presented, read back as XRGB8888, top row first, w * 4 bytes
+ * a row, for the host's previews and shots. False with no GPU frame yet. */
+bool  diatom_port_gpu_read(void *xrgb, int *w, int *h, size_t cap);
 
 /* Interleaved stereo S16 at caps.audio_rate. NEVER blocks; drops on overflow.
  * A blocking write is a legitimate sync strategy but is incompatible with
