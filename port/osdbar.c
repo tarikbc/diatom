@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/osdbar.c at 65f3f90, which is where it is changed:
+/* Vendored from ZyperOS (TortOS) src/osdbar.c at f972dad, which is where it is changed:
  * the launcher, this port and portkeys draw the same bar from the same code. Copy
  * it back here whole when it changes there. */
 /* The volume and brightness bar's pixels. See src/osdbar.h. */
@@ -14,7 +14,7 @@
 #define PILL_W   452.0f
 #define PILL_H   64.0f
 #define PILL_R   (PILL_H / 2)
-#define BORDER   2.0f
+#define BORDER   ((float)DS_FRAME)  /* edge, the 3-unit line around a surface (DESIGN.md 3.2) */
 #define ICON_CX  (PILL_X0 + 40.0f)
 #define ICON_S   40.0f             /* the mark's box */
 #define STROKE   4.0f              /* its lines */
@@ -128,7 +128,9 @@ static float sd(const shape *s, float x, float y)
  *
  * Into a float buffer of premultiplied RGBA, one shape at a time over its own
  * bounds, with "over". The bar is small - 298 x 58 pixels on the panel - and
- * drawn only when the level changes, not every frame. */
+ * painted only when what it shows changes: a fade, which Diatom and portkeys
+ * make by asking for the same bar at a new opacity every frame, only turns
+ * the painted buffer into pixels again (osdbar_render). */
 
 typedef struct {
 	float *f;                      /* w * h * 4 */
@@ -263,42 +265,66 @@ void osdbar_size(float scale, int *w, int *h)
 void osdbar_render(uint32_t *px, int w, int h, int stride, float scale,
                    int theme, int kind, int level, int max, float alpha, bool premul)
 {
-	/* The largest the bar is ever drawn, at scale 1: 476 x 92 pixels. */
+	/* The largest the bar is ever drawn, at scale 1: 476 x 92 pixels. Kept
+	 * from one call to the next with what it was painted for, so a call that
+	 * asks for the same bar - the same theme, kind, level, steps, scale and
+	 * size - at another opacity, or premultiplied where it was straight, is
+	 * only the conversion at the end: about twenty a show, each a whole
+	 * paint before, on the thread Diatom presents from. */
 	static float f[OSDBAR_W * OSDBAR_H * 4];
-	canvas cv = { f, w, h, scale };
-	const ds_theme *th;
-	float col[3], track[3], surface[3], edge[3], ink[3];
-	const float pix = 1.0f / scale;            /* a pixel, in units */
-	const float cy = PILL_Y0 + PILL_H / 2;
-	shape sh = rbox(PILL_X0, PILL_Y0 + SHADOW_DY, PILL_X0 + PILL_W, PILL_Y0 + PILL_H + SHADOW_DY, PILL_R);
-	shape body = rbox(PILL_X0, PILL_Y0, PILL_X0 + PILL_W, PILL_Y0 + PILL_H, PILL_R);
-	float sw;
-	int i, x, y;
+	static struct {
+		bool valid;
+		int theme, kind, level, max, w, h;
+		float scale;
+	} painted;
+	int x, y;
 
 	if ((size_t)w * h > sizeof f / sizeof f[0] / 4) return;
 	if (theme < 0 || theme >= DS_THEMES) theme = DS_LIGHT;
-	th = &DS_THEME[theme];
-	rgb3(col, kind == OSDBAR_BRIGHT ? th->light : th->accent_ink);
-	rgb3(track, th->track);
-	rgb3(surface, th->surface);
-	rgb3(edge, th->edge);
-	rgb3(ink, th->ink);
 	if (max < 1) max = 1;
 	if (level < 0) level = 0;
 	if (level > max) level = max;
-	memset(f, 0, (size_t)w * h * 4 * sizeof f[0]);
+	if (!painted.valid || painted.theme != theme || painted.kind != kind ||
+	    painted.level != level || painted.max != max || painted.w != w || painted.h != h ||
+	    painted.scale != scale) {
+		canvas cv = { f, w, h, scale };
+		const ds_theme *th = &DS_THEME[theme];
+		float col[3], track[3], surface[3], edge[3], ink[3];
+		const float pix = 1.0f / scale;            /* a pixel, in units */
+		const float cy = PILL_Y0 + PILL_H / 2;
+		shape sh = rbox(PILL_X0, PILL_Y0 + SHADOW_DY, PILL_X0 + PILL_W,
+		                PILL_Y0 + PILL_H + SHADOW_DY, PILL_R);
+		shape body = rbox(PILL_X0, PILL_Y0, PILL_X0 + PILL_W, PILL_Y0 + PILL_H, PILL_R);
+		float sw;
+		int i;
 
-	paint(&cv, &sh, ink, th->bar_shadow / 255.0f, SHADOW_SOFT, NULL, 0);
-	paint(&cv, &body, edge, BODY_A, pix, surface, BORDER);
-	if (kind == OSDBAR_BRIGHT) sun(&cv, ICON_CX, cy, level, max, col, pix);
-	else                       speaker(&cv, ICON_CX, cy, level, max, col, pix);
+		rgb3(col, kind == OSDBAR_BRIGHT ? th->light : th->accent_ink);
+		rgb3(track, th->track);
+		rgb3(surface, th->surface);
+		rgb3(edge, th->edge);
+		rgb3(ink, th->ink);
+		memset(f, 0, (size_t)w * h * 4 * sizeof f[0]);
 
-	/* One segment per step, widths shared out evenly across the track. */
-	sw = (SEG_X1 - SEG_X0 - SEG_GAP * (max - 1)) / max;
-	for (i = 0; i < max; i++) {
-		float x0 = SEG_X0 + i * (sw + SEG_GAP);
-		shape seg = rbox(x0, cy - SEG_H / 2, x0 + sw, cy + SEG_H / 2, SEG_R);
-		paint(&cv, &seg, i < level ? col : track, 1, pix, NULL, 0);
+		paint(&cv, &sh, ink, th->bar_shadow / 255.0f, SHADOW_SOFT, NULL, 0);
+		paint(&cv, &body, edge, BODY_A, pix, surface, BORDER);
+		if (kind == OSDBAR_BRIGHT) sun(&cv, ICON_CX, cy, level, max, col, pix);
+		else                       speaker(&cv, ICON_CX, cy, level, max, col, pix);
+
+		/* One segment per step, widths shared out evenly across the track. */
+		sw = (SEG_X1 - SEG_X0 - SEG_GAP * (max - 1)) / max;
+		for (i = 0; i < max; i++) {
+			float x0 = SEG_X0 + i * (sw + SEG_GAP);
+			shape seg = rbox(x0, cy - SEG_H / 2, x0 + sw, cy + SEG_H / 2, SEG_R);
+			paint(&cv, &seg, i < level ? col : track, 1, pix, NULL, 0);
+		}
+		painted.valid = true;
+		painted.theme = theme;
+		painted.kind = kind;
+		painted.level = level;
+		painted.max = max;
+		painted.w = w;
+		painted.h = h;
+		painted.scale = scale;
 	}
 
 	if (alpha < 0) alpha = 0;

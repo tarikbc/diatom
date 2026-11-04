@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/osdbar.h at 65f3f90, which is where it is changed:
+/* Vendored from ZyperOS (TortOS) src/osdbar.h at f972dad, which is where it is changed:
  * the launcher, this port and portkeys draw the same bar from the same code. Copy
  * it back here whole when it changes there. */
 #ifndef TORTOS_OSDBAR_H
@@ -76,7 +76,9 @@ void osdbar_size(float scale, int *w, int *h);
  * `premul` gives premultiplied color, which the display controller's
  * blending expects; SDL's default blending wants it straight. `alpha`
  * (0..1) is multiplied in, for a host that fades by redrawing rather than by
- * blending the whole thing. */
+ * blending the whole thing: a call that differs from the one before only in
+ * `alpha` or `premul` does not paint the bar again but converts what the last
+ * one painted, kept in one static buffer - so this is for one thread. */
 void osdbar_render(uint32_t *px, int w, int h, int stride, float scale,
                    int theme, int kind, int level, int max, float alpha, bool premul);
 
