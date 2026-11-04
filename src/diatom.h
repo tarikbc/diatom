@@ -135,6 +135,18 @@ void diatom_env_core_log_summary(void);
 void diatom_env_frame_shown(bool shown);
 bool diatom_env_frame_skippable(void);
 
+/* hw.c - a core that draws with the GPU (libretro's hardware rendering).
+ * _request answers SET_HW_RENDER; _load_begin forgets the last game's ask;
+ * _start brings the context up after a successful load and tells the core;
+ * _unload_begin and _unload_end bracket retro_unload_game. While _active, the
+ * core's frames are the port's GPU frames, not pixels. */
+bool diatom_hw_request(struct retro_hw_render_callback *cb, const diatom_port_caps *caps);
+void diatom_hw_load_begin(void);
+bool diatom_hw_start(diatom_core *c);
+void diatom_hw_unload_begin(void);
+void diatom_hw_unload_end(void);
+bool diatom_hw_active(void);
+
 /* options.c - what a core can be configured with, and what it currently is.
  *
  * Diatom holds the definitions and the values; the LAUNCHER decides what the

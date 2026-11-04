@@ -83,6 +83,7 @@ static bool                g_have_master;
 static EGLDisplay g_egl_display = EGL_NO_DISPLAY;
 static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
+static EGLConfig  g_egl_config;
 
 /* The panel in its own terms, and the surface as the host sees it. On this
  * device the panel is 480x640 and the surface 640x480; g_turned says the two
@@ -108,6 +109,14 @@ typedef struct {
 	 * and the frame it was made for reach the panel together. */
 	diatom_plane  planes[DIATOM_PLANES_MAX];
 	int           nplanes;
+	/* A GPU frame (present_gpu) is no pixels at all: the slot's texture,
+	 * which the core drew into on its own context, tex_w x tex_h with the
+	 * frame at its bottom-left, and the fence that says the drawing is done.
+	 * The thread waits on the fence before it samples. */
+	bool          gpu;
+	GLuint        gpu_tex;
+	int           tex_w, tex_h;
+	EGLSyncKHR    fence;
 } mailbox_frame;
 
 static mailbox_frame    g_frames[MAILBOX_FRAMES];
@@ -134,6 +143,70 @@ static GLuint g_prog_plain, g_prog_sharp, g_prog_solid;
 static GLuint g_frame_tex, g_overlay_tex;
 static int    g_tex_w = -1, g_tex_h = -1;
 static diatom_pixfmt g_tex_fmt;
+
+/* ---------- GPU frames ------------------------------------------------------- */
+
+/* A core that draws with the GPU (diatom_port_gpu_begin) gets a context of its
+ * own on the host's thread, sharing textures with the thread's, and one
+ * framebuffer per mailbox slot: slot i draws into texture g_gpu_tex[i], so a
+ * GPU frame takes the same roles a pixel frame does (front, inflight,
+ * pending), and the texture of a slot holding a role is never drawn into.
+ * Framebuffers are the core context's own; only the textures are shared.
+ *
+ * Two fences keep the two contexts apart. present_gpu leaves one after the
+ * core's drawing, which the thread waits on before sampling (the frame's
+ * `fence`); the thread leaves one after sampling (g_gpu_done), which
+ * gpu_target waits on before the core draws into that texture again. By then
+ * it has nearly always passed: the slot was free, so the thread is two frames
+ * on. */
+static EGLContext g_gpu_ctx = EGL_NO_CONTEXT;
+static GLuint     g_gpu_tex[MAILBOX_FRAMES], g_gpu_fbo[MAILBOX_FRAMES], g_gpu_depth;
+static EGLSyncKHR g_gpu_done[MAILBOX_FRAMES];    /* under g_mx */
+static int        g_gpu_w, g_gpu_h;
+static int        g_gpu_drawing = -1;            /* the slot the core draws into; under g_mx */
+static int        g_gpu_last = -1;               /* the slot of the last GPU frame presented */
+
+static PFNEGLCREATESYNCKHRPROC     p_create_sync;
+static PFNEGLDESTROYSYNCKHRPROC    p_destroy_sync;
+static PFNEGLCLIENTWAITSYNCKHRPROC p_client_wait;
+
+static bool sync_procs(void)
+{
+	if (!p_create_sync) {
+		p_create_sync  = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+		p_destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+		p_client_wait  = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+	}
+	return p_create_sync && p_destroy_sync && p_client_wait;
+}
+
+static void wait_sync(EGLSyncKHR s)
+{
+	if (s == EGL_NO_SYNC_KHR) return;
+	p_client_wait(g_egl_display, s, 0, EGL_FOREVER_KHR);
+	p_destroy_sync(g_egl_display, s);
+}
+
+/* A frame dropped unseen (stolen from pending) leaves its fence unwaited. */
+static void drop_fence(int slot)
+{
+	mailbox_frame *f;
+
+	if (slot < 0) return;
+	f = &g_frames[slot];
+	if (f->gpu && f->fence != EGL_NO_SYNC_KHR) {
+		p_destroy_sync(g_egl_display, f->fence);
+		f->fence = EGL_NO_SYNC_KHR;
+	}
+}
+
+/* The thread, before it samples a GPU frame: the core's drawing is done. */
+static void gpu_frame_ready(mailbox_frame *f)
+{
+	if (!f->gpu || f->fence == EGL_NO_SYNC_KHR) return;
+	wait_sync(f->fence);
+	f->fence = EGL_NO_SYNC_KHR;
+}
 
 /* ---------- the overlay and the level bar ----------------------------------- */
 
@@ -610,6 +683,7 @@ static void upload_frame(const mailbox_frame *f)
 	size_t bpp = (f->fmt == DIATOM_PIX_RGB565) ? 2 : 4;
 	bool realloc_tex = f->w != g_tex_w || f->h != g_tex_h || f->fmt != g_tex_fmt;
 
+	if (f->gpu) return;             /* already a texture: the core drew it */
 	glBindTexture(GL_TEXTURE_2D, g_frame_tex);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(f->pitch / bpp));
@@ -729,16 +803,24 @@ static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
 {
 	GLuint prog = f->filter == DIATOM_FILTER_SHARP ? g_prog_sharp : g_prog_plain;
 	GLint  filter = f->filter == DIATOM_FILTER_SHARP ? GL_LINEAR : GL_NEAREST;
+	/* A GPU frame is GL's way up, its first row at the bottom of a texture
+	 * larger than it: sampled from row h down to row 0, so the same quads
+	 * draw it upright. */
+	float  top  = f->gpu ? (float)f->h : 0.0f;
+	float  down = f->gpu ? -1.0f : 1.0f;
 
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	glBindTexture(GL_TEXTURE_2D, g_frame_tex);
+	glBindTexture(GL_TEXTURE_2D, f->gpu ? f->gpu_tex : g_frame_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+	/* Whatever alpha the core left in it, the panel gets 1 (see below) */
+	if (f->gpu) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
 	glUseProgram(prog);
 	glUniform1i(glGetUniformLocation(prog, "u_tex"), 0);
-	glUniform2f(glGetUniformLocation(prog, "u_size"), (float)f->w, (float)f->h);
+	glUniform2f(glGetUniformLocation(prog, "u_size"),
+	            (float)(f->gpu ? f->tex_w : f->w), (float)(f->gpu ? f->tex_h : f->h));
 	glUniformMatrix3fv(glGetUniformLocation(prog, "u_matrix"), 1, GL_TRUE, g_matrix);
 	glUniform1i(glGetUniformLocation(prog, "u_panel"), g_matrix_on);
 	if (f->nplanes) {
@@ -760,16 +842,16 @@ static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
 				            (float)p->dst.h / (float)p->src.h);
 			draw_quad_from((float)p->dst.x, (float)p->dst.y,
 			               (float)p->dst.w, (float)p->dst.h,
-			               (float)p->src.x, (float)p->src.y,
-			               (float)p->src.w, (float)p->src.h, turned);
+			               (float)p->src.x, top + down * (float)p->src.y,
+			               (float)p->src.w, down * (float)p->src.h, turned);
 		}
 	} else {
 		if (prog == g_prog_sharp)
 			glUniform2f(glGetUniformLocation(prog, "u_scale"),
 			            (float)f->dst.w / (float)f->w, (float)f->dst.h / (float)f->h);
 		/* dst may reach past the surface (fill, overscale): GL clips it. */
-		draw_quad((float)f->dst.x, (float)f->dst.y, (float)f->dst.w, (float)f->dst.h,
-		          (float)f->w, (float)f->h, turned);
+		draw_quad_from((float)f->dst.x, (float)f->dst.y, (float)f->dst.w, (float)f->dst.h,
+		               0.0f, top, (float)f->w, down * (float)f->h, turned);
 	}
 
 	/* Alpha in the target stays 1 whatever is blended over it: the scanout
@@ -998,6 +1080,7 @@ static bool gl_start(void)
 		diatom_port_log(DIATOM_LOG_ERROR, "pixel2: no GBM surface");
 		return false;
 	}
+	g_egl_config  = config;
 	g_egl_context = eglCreateContext(g_egl_display, config, EGL_NO_CONTEXT, context_attribs);
 	g_egl_surface = eglCreateWindowSurface(g_egl_display, config,
 	                                       (EGLNativeWindowType)g_gbm_surface, NULL);
@@ -1105,6 +1188,7 @@ static void *present_thread(void *arg)
 		bool ov_live, osd_live, lowbat;
 		int osd_kind, osd_level, osd_max;
 		uint64_t now, t0 = 0;
+		EGLSyncKHR done;
 
 		if (g_pending < 0 && !g_want_blank && !g_capture_path) {
 			pthread_cond_wait(&g_cv, &g_mx);
@@ -1163,9 +1247,14 @@ static void *present_thread(void *arg)
 		pthread_mutex_unlock(&g_mx);
 
 		if (g_present_debug) t0 = diatom_port_now_us();
+		gpu_frame_ready(&g_frames[frame]);
 		upload_frame(&g_frames[frame]);
 		draw_scene(&g_frames[frame], ov_live, osd_live, osd_kind, osd_level,
 		           osd_max, lowbat, g_turned);
+		/* The core may draw into this texture again once the GPU has read
+		 * it: a fence for diatom_port_gpu_target to wait on. */
+		done = g_frames[frame].gpu
+		     ? p_create_sync(g_egl_display, EGL_SYNC_FENCE_KHR, NULL) : EGL_NO_SYNC_KHR;
 		eglSwapBuffers(g_egl_display, g_egl_surface);
 		if (g_present_debug) {
 			static int n;
@@ -1181,6 +1270,11 @@ static void *present_thread(void *arg)
 		pthread_mutex_lock(&g_mx);
 		g_front    = frame;
 		g_inflight = -1;
+		if (done != EGL_NO_SYNC_KHR) {
+			if (g_gpu_done[frame] != EGL_NO_SYNC_KHR)
+				p_destroy_sync(g_egl_display, g_gpu_done[frame]);
+			g_gpu_done[frame] = done;
+		}
 		pthread_cond_broadcast(&g_idle);
 	}
 	pthread_mutex_unlock(&g_mx);
@@ -1228,14 +1322,19 @@ void diatom_port_present(const void *src, int w, int h, size_t pitch,
 
 	pthread_mutex_lock(&g_mx);
 	for (i = 0; i < MAILBOX_FRAMES; i++)
-		if (i != g_front && i != g_inflight && i != g_pending) break;
+		if (i != g_front && i != g_inflight && i != g_pending && i != g_gpu_drawing) break;
 	if (i == MAILBOX_FRAMES) {
 		i = g_pending;
 		g_pending = -1;
+		drop_fence(i);
 	}
 	pthread_mutex_unlock(&g_mx);
+	/* Every slot busy and none pending: the core holds one to draw into. A
+	 * GPU core's session presents no pixels, so this is never its frame. */
+	if (i < 0) return;
 
 	f = &g_frames[i];
+	f->gpu = false;
 	need = pitch * (size_t)h;
 	if (need > f->cap) {
 		/* Grows only, and only when a core's geometry outgrows every frame so
@@ -1282,6 +1381,251 @@ void diatom_port_present(const void *src, int w, int h, size_t pitch,
 	g_pending = i;
 	pthread_cond_signal(&g_cv);
 	pthread_mutex_unlock(&g_mx);
+}
+
+/* ---------- GPU frames: the port interface ------------------------------------
+ * See the GPU frames section near the top for the slots and the fences. */
+
+bool diatom_port_gpu_begin(const diatom_gpu_spec *spec)
+{
+	EGLint attribs[] = { EGL_CONTEXT_MAJOR_VERSION, spec->major >= 3 ? 3 : 2, EGL_NONE };
+	GLint max_tex = 0;
+	int i;
+
+	if (g_gpu_ctx != EGL_NO_CONTEXT) diatom_port_gpu_end();
+	if (!g_thread_running || g_egl_context == EGL_NO_CONTEXT || !sync_procs()) {
+		diatom_port_log(DIATOM_LOG_ERROR, "pixel2: no GPU for the core (no display or no fences)");
+		return false;
+	}
+	/* Sharing the thread's context: its textures are the core's targets */
+	g_gpu_ctx = eglCreateContext(g_egl_display, g_egl_config, g_egl_context, attribs);
+	if (g_gpu_ctx == EGL_NO_CONTEXT && attribs[1] == 2) {
+		attribs[1] = 3;                 /* OpenGL ES 3 runs an ES 2 core as well */
+		g_gpu_ctx = eglCreateContext(g_egl_display, g_egl_config, g_egl_context, attribs);
+	}
+	if (g_gpu_ctx == EGL_NO_CONTEXT ||
+	    !eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, g_gpu_ctx)) {
+		port_logf(DIATOM_LOG_ERROR, "pixel2: no OpenGL ES %d context for the core (0x%x)",
+		          attribs[1], eglGetError());
+		if (g_gpu_ctx != EGL_NO_CONTEXT) eglDestroyContext(g_egl_display, g_gpu_ctx);
+		g_gpu_ctx = EGL_NO_CONTEXT;
+		return false;
+	}
+
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+	g_gpu_w = spec->max_w > 0 ? spec->max_w : g_surface_w;
+	g_gpu_h = spec->max_h > 0 ? spec->max_h : g_surface_h;
+	if (max_tex > 0 && g_gpu_w > max_tex) g_gpu_w = max_tex;
+	if (max_tex > 0 && g_gpu_h > max_tex) g_gpu_h = max_tex;
+
+	/* One depth and stencil buffer for every slot: the core draws one frame
+	 * at a time, and nothing of a frame's depth outlives it. */
+	g_gpu_depth = 0;
+	if (spec->depth || spec->stencil) {
+		glGenRenderbuffers(1, &g_gpu_depth);
+		glBindRenderbuffer(GL_RENDERBUFFER, g_gpu_depth);
+		glRenderbufferStorage(GL_RENDERBUFFER,
+		                      spec->stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16,
+		                      g_gpu_w, g_gpu_h);
+	}
+	glGenTextures(MAILBOX_FRAMES, g_gpu_tex);
+	glGenFramebuffers(MAILBOX_FRAMES, g_gpu_fbo);
+	for (i = 0; i < MAILBOX_FRAMES; i++) {
+		glBindTexture(GL_TEXTURE_2D, g_gpu_tex[i]);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_gpu_w, g_gpu_h, 0,
+		             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_fbo[i]);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+		                       g_gpu_tex[i], 0);
+		/* Depth and stencil apart, which OpenGL ES 2 takes as well as 3 */
+		if (g_gpu_depth)
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+			                          GL_RENDERBUFFER, g_gpu_depth);
+		if (g_gpu_depth && spec->stencil)
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+			                          GL_RENDERBUFFER, g_gpu_depth);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			diatom_port_log(DIATOM_LOG_ERROR, "pixel2: the core's framebuffer is incomplete");
+			diatom_port_gpu_end();
+			return false;
+		}
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glFinish();
+
+	pthread_mutex_lock(&g_mx);
+	g_gpu_drawing = -1;
+	pthread_mutex_unlock(&g_mx);
+	g_gpu_last = -1;
+	port_logf(DIATOM_LOG_INFO, "pixel2: GPU frames on OpenGL ES %d, up to %dx%d%s%s",
+	          attribs[1], g_gpu_w, g_gpu_h, spec->depth ? ", depth" : "",
+	          spec->stencil ? ", stencil" : "");
+	return true;
+}
+
+void diatom_port_gpu_end(void)
+{
+	int i;
+
+	if (g_gpu_ctx == EGL_NO_CONTEXT) return;
+	/* Nothing of the core's may still be on its way to the panel, and the
+	 * front frame, once its texture is gone, may never be drawn again. */
+	drain();
+	pthread_mutex_lock(&g_mx);
+	for (i = 0; i < MAILBOX_FRAMES; i++) {
+		drop_fence(i);
+		if (g_gpu_done[i] != EGL_NO_SYNC_KHR) {
+			p_destroy_sync(g_egl_display, g_gpu_done[i]);
+			g_gpu_done[i] = EGL_NO_SYNC_KHR;
+		}
+	}
+	if (g_front >= 0 && g_frames[g_front].gpu) g_front = -1;
+	for (i = 0; i < MAILBOX_FRAMES; i++) g_frames[i].gpu = false;
+	g_gpu_drawing = -1;
+	pthread_mutex_unlock(&g_mx);
+	g_gpu_last = -1;
+
+	eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, g_gpu_ctx);
+	glDeleteFramebuffers(MAILBOX_FRAMES, g_gpu_fbo);
+	glDeleteTextures(MAILBOX_FRAMES, g_gpu_tex);
+	if (g_gpu_depth) glDeleteRenderbuffers(1, &g_gpu_depth);
+	memset(g_gpu_fbo, 0, sizeof g_gpu_fbo);
+	memset(g_gpu_tex, 0, sizeof g_gpu_tex);
+	g_gpu_depth = 0;
+	eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+	eglDestroyContext(g_egl_display, g_gpu_ctx);
+	g_gpu_ctx = EGL_NO_CONTEXT;
+}
+
+uintptr_t diatom_port_gpu_target(void)
+{
+	EGLSyncKHR done = EGL_NO_SYNC_KHR;
+	int i;
+
+	if (g_gpu_ctx == EGL_NO_CONTEXT) return 0;
+	pthread_mutex_lock(&g_mx);
+	if (g_gpu_drawing < 0) {
+		for (i = 0; i < MAILBOX_FRAMES; i++)
+			if (i != g_front && i != g_inflight && i != g_pending) break;
+		if (i == MAILBOX_FRAMES) {      /* all three taken: the newest wins */
+			i = g_pending;
+			g_pending = -1;
+			drop_fence(i);
+		}
+		g_gpu_drawing = i;
+		done = g_gpu_done[i];
+		g_gpu_done[i] = EGL_NO_SYNC_KHR;
+	}
+	i = g_gpu_drawing;
+	pthread_mutex_unlock(&g_mx);
+	wait_sync(done);
+	return g_gpu_fbo[i];
+}
+
+void *diatom_port_gpu_proc(const char *name)
+{
+	return (void *)eglGetProcAddress(name);
+}
+
+void diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter)
+{
+	mailbox_frame *f;
+	EGLSyncKHR fence;
+	int i;
+
+	if (g_gpu_ctx == EGL_NO_CONTEXT || w <= 0 || h <= 0 || !g_thread_running) return;
+	pthread_mutex_lock(&g_mx);
+	i = g_gpu_drawing;
+	pthread_mutex_unlock(&g_mx);
+	if (i < 0) return;              /* nothing drawn since the last one */
+	if (w > g_gpu_w) w = g_gpu_w;
+	if (h > g_gpu_h) h = g_gpu_h;
+
+	/* Into the core's command stream after its drawing, and flushed: the
+	 * thread's wait flushes only its own context. */
+	fence = p_create_sync(g_egl_display, EGL_SYNC_FENCE_KHR, NULL);
+	glFlush();
+
+	{
+		static int lw = -1, lh = -1;
+
+		if (w != lw || h != lh) {
+			lw = w; lh = h;
+			port_logf(DIATOM_LOG_INFO,
+			          "present: GPU frame %dx%d of %dx%d -> dst %dx%d at %d,%d %s",
+			          w, h, g_gpu_w, g_gpu_h, dst.w, dst.h, dst.x, dst.y,
+			          filter == DIATOM_FILTER_SHARP ? "sharp" : "nearest");
+		}
+	}
+	f = &g_frames[i];
+	f->gpu = true;
+	f->gpu_tex = g_gpu_tex[i];
+	f->tex_w = g_gpu_w;
+	f->tex_h = g_gpu_h;
+	f->w = w;
+	f->h = h;
+	f->fmt = DIATOM_PIX_XRGB8888;
+	f->dst = dst;
+	f->filter = filter;
+	f->fence = fence;
+	f->nplanes = g_nplanes;
+	if (g_nplanes) memcpy(f->planes, g_planes, sizeof g_planes[0] * (size_t)g_nplanes);
+	g_gpu_last = i;
+
+	pthread_mutex_lock(&g_mx);
+	if (g_pending >= 0 && g_pending != i) drop_fence(g_pending);
+	g_presented = true;
+	g_pending = i;
+	g_gpu_drawing = -1;
+	pthread_cond_signal(&g_cv);
+	pthread_mutex_unlock(&g_mx);
+}
+
+bool diatom_port_gpu_read(void *xrgb, int *w, int *h, size_t cap)
+{
+	const mailbox_frame *f;
+	GLint prev_fb = 0, prev_align = 4;
+	uint8_t *rgba;
+	uint32_t *out = xrgb;
+	int x, y, fw, fh;
+
+	if (g_gpu_ctx == EGL_NO_CONTEXT || g_gpu_last < 0 || !xrgb) return false;
+	f = &g_frames[g_gpu_last];
+	fw = f->w;
+	fh = f->h;
+	if ((size_t)fw * (size_t)fh * 4 > cap) return false;
+	rgba = malloc((size_t)fw * (size_t)fh * 4);
+	if (!rgba) return false;
+
+	/* The core's own bindings are put back: its state cache (glsm) does not
+	 * expect them to move between frames. */
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fb);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_align);
+	glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_fbo[g_gpu_last]);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	glReadPixels(0, 0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+	glPixelStorei(GL_PACK_ALIGNMENT, prev_align);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
+
+	/* Bottom row first in GL, top row first out; RGBA bytes to 0x00RRGGBB */
+	for (y = 0; y < fh; y++) {
+		const uint8_t *s = rgba + (size_t)(fh - 1 - y) * (size_t)fw * 4;
+		uint32_t *d = out + (size_t)y * (size_t)fw;
+
+		for (x = 0; x < fw; x++, s += 4)
+			d[x] = (uint32_t)s[0] << 16 | (uint32_t)s[1] << 8 | s[2];
+	}
+	free(rgba);
+	*w = fw;
+	*h = fh;
+	return true;
 }
 
 void diatom_port_overlay(const uint8_t *bgra, int w, int h, unsigned ms)
@@ -1809,6 +2153,7 @@ bool diatom_port_init(diatom_port_caps *out)
 	out->audio_rate          = AUDIO_RATE;
 	out->audio_buffer_frames = AUDIO_BUFFER_FRAMES;   /* open or not yet */
 	out->present_blocks      = false;
+	out->gpu                 = true;
 	return true;
 }
 

@@ -243,6 +243,15 @@ static bool env_cb(unsigned cmd, void *data)
 		g_policy->pixfmt_set = true;
 		return true;
 	}
+	case MASK(RETRO_ENVIRONMENT_SET_HW_RENDER):
+		/* A core that draws with the GPU. See hw.c. */
+		return diatom_hw_request(data, g_caps);
+	case MASK(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER):
+		/* OpenGL ES 3, which runs an ES 2 core too. Asked before the core
+		 * says which it wants; a port with no GPU frames prefers none. */
+		if (!g_caps || !g_caps->gpu) return false;
+		*(unsigned *)data = RETRO_HW_CONTEXT_OPENGLES3;
+		return true;
 	case MASK(RETRO_ENVIRONMENT_SET_GEOMETRY):
 	case MASK(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO): {
 		/* The new geometry is CARRIED now, not just flagged.

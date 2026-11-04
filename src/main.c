@@ -213,8 +213,31 @@ static int          g_nplanes;
  * preview is that rect's picture, composed (scr_compose) - the in-game menu
  * then sits over what the player was looking at, not over a tall strip
  * squeezed into the wrong box. Once per pause and once at exit. */
+/* A GPU frame (hw.c) is no pixels until asked: read back into g_frame as
+ * XRGB8888, top row first, for a preview. Once per pause and once at exit,
+ * like the preview itself, so the cost of the read never reaches a frame. */
+static void gpu_snapshot(void)
+{
+	size_t need = (size_t)g_frame_w * (size_t)g_frame_h * 4;
+	int w = 0, h = 0;
+
+	if (!diatom_hw_active() || need == 0) return;
+	if (need > g_frame_cap) {
+		void *p = realloc(g_frame, need);
+		if (!p) return;
+		g_frame = p;
+		g_frame_cap = need;
+	}
+	if (!diatom_port_gpu_read(g_frame, &w, &h, g_frame_cap)) return;
+	g_frame_w = w;
+	g_frame_h = h;
+	g_frame_pitch = (size_t)w * 4;
+	g_policy.pixfmt = DIATOM_PIX_XRGB8888;
+}
+
 static bool write_preview(const char *path)
 {
+	gpu_snapshot();
 	if (g_dual && g_nplanes > 0 && g_frame) {
 		int bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4, w = 0, h = 0;
 		void *pic = scr_compose(g_frame, g_frame_pitch, bpp, g_planes, g_nplanes, &w, &h);
@@ -508,6 +531,14 @@ void diatom_on_video(const void *data, unsigned w, unsigned h, size_t pitch)
 	size_t need;
 
 	if (!data) return;          /* dupe: keep the previous frame */
+	/* Drawn by the GPU into the port's framebuffer (hw.c): no pixels to copy,
+	 * only the size. Not turned: no GPU core here asks for a rotation. */
+	if (data == RETRO_HW_FRAME_BUFFER_VALID) {
+		g_frame_w = (int)w;
+		g_frame_h = (int)h;
+		g_frame_fresh = true;
+		return;
+	}
 	/* A turned frame is stored packed, which is never more than pitch * h,
 	 * so one size covers both and the buffer still only grows - the frame
 	 * loop allocates nothing once it has seen its largest frame. */
@@ -1422,6 +1453,10 @@ static void present_frame(bool fresh)
 	int  bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4;
 	bool cur = g_dual && sty_on() && g_frame && g_frame_w > 0;
 
+	if (diatom_hw_active()) {
+		if (fresh) diatom_port_present_gpu(g_frame_w, g_frame_h, g_dst, g_filter);
+		return;
+	}
 	if (cur) sty_stamp(g_frame, g_frame_pitch, bpp, g_frame_w, g_frame_h);
 	diatom_port_present((fresh || cur) ? g_frame : NULL,
 	                    g_frame_w, g_frame_h, g_frame_pitch,
@@ -1768,9 +1803,12 @@ static int run_session_inner(const diatom_session *sn)
 		g_audio_warmup = true;
 		for (w = 0; w < 3; w++) {
 			g_core->run();
-			diatom_port_present(g_frame, g_frame_w, g_frame_h, g_frame_pitch,
-			                    g_policy.pixfmt, g_dst,
-			                    g_filter);
+			if (diatom_hw_active())
+				present_frame(g_frame_fresh);
+			else
+				diatom_port_present(g_frame, g_frame_w, g_frame_h, g_frame_pitch,
+				                    g_policy.pixfmt, g_dst,
+				                    g_filter);
 		}
 		g_audio_warmup = false;
 		printf("diatom: warmup 3 frames in %.1f ms\n",
