@@ -259,9 +259,8 @@ static bool takes_archives(const struct retro_system_info *si)
 static bool start_gpu(diatom_core *c)
 {
 	if (diatom_hw_start(c)) return true;
-	diatom_hw_unload_begin();
 	c->unload_game();
-	diatom_hw_unload_end();
+	diatom_hw_unload();
 	c->game_loaded = false;
 	return false;
 }
@@ -387,9 +386,20 @@ bool diatom_core_start(diatom_core *c, const char *rom_path)
 void diatom_core_stop(diatom_core *c)
 {
 	if (c->game_loaded) {
-		diatom_hw_unload_begin();
+		bool gpu = diatom_hw_active();
+
 		c->unload_game();
-		diatom_hw_unload_end();
+		diatom_hw_unload();
 		c->game_loaded = false;
+		/* Except a core that drew with the GPU, which is put down whole and
+		 * initialized again for its next game, as RetroArch does between
+		 * games: flycast2021 starts its emulation thread on the first
+		 * retro_run after retro_init and never again, so its second game in
+		 * a resident Diatom ran no emulation at all (2026-11-04). Its
+		 * retro_init takes 0.1 ms. */
+		if (gpu && c->initialized) {
+			c->deinit();
+			c->initialized = false;
+		}
 	}
 }

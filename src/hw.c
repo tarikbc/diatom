@@ -103,16 +103,14 @@ bool diatom_hw_start(diatom_core *c)
 	return true;
 }
 
-void diatom_hw_unload_begin(void)
+void diatom_hw_unload(void)
 {
-	/* Before retro_unload_game, with the context still current, so a core
-	 * that frees its GL objects there frees them on the right context. */
-	if (g_live && g_hw.context_destroy) g_hw.context_destroy();
-}
-
-void diatom_hw_unload_end(void)
-{
+	/* After retro_unload_game, as RetroArch does it, and with the context
+	 * still current. Before it, flycast2021 stopped drawing at once, its
+	 * emulation thread waited on a frame that never came, and the unload
+	 * waited on that thread: Quit hung (2026-11-04). */
 	if (!g_live) return;
+	if (g_hw.context_destroy) g_hw.context_destroy();
 	diatom_port_gpu_end();
 	g_core->run = g_core_run;
 	g_core = NULL;

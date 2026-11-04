@@ -16,7 +16,25 @@
 #include "cheevos.h"
 #include "diatom.h"
 
-#define MASK(x) ((x) & 0xffff)   /* experimental commands carry 0x10000 */
+/* Experimental commands carry 0x10000, and the same command reads the same
+ * with or without it. ONLY that bit: RetroArch's private commands sit at
+ * 0x800000 and up, and cut to 16 bits flycast2021's ask for the clear-waits
+ * callback (3 there) read as GET_CAN_DUPE (3), whose answer, true, went into
+ * the core's function pointer. The core called it at unload: SIGBUS at
+ * address 1 on every Quit (2026-11-04). */
+#define MASK(x) ((x) & ~(unsigned)RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+/* RetroArch's own, not in libretro.h: the callback a threaded core calls
+ * around the end of a game to have the frontend let go of any thread it is
+ * holding. flycast2021 calls it at unload without checking it got one. */
+#define RA_GET_CLEAR_ALL_THREAD_WAITS_CB (3 | 0x800000)
+
+static bool clear_thread_waits(unsigned clear, void *data)
+{
+	(void)data;
+	diatom_audio_hold_waits(clear == 0);
+	return true;
+}
 
 static void capture_descriptors(const struct retro_input_descriptor *d);
 
@@ -227,8 +245,30 @@ static void core_log(enum retro_log_level level, const char *fmt, ...)
 	diatom_port_log(l, buf);
 }
 
+/* The performance interface: a clock and the CPU's SIMD, and counters that
+ * count nothing. flycast2021 reads the clock in retro_serialize without
+ * asking whether it got one, so declining it crashed every save state there
+ * (the game restarted at the BIOS logo, 2026-11-04). */
+static retro_time_t perf_time_usec(void) { return (retro_time_t)diatom_port_now_us(); }
+static uint64_t perf_cpu_features(void)
+{
+#if defined(__aarch64__)
+	return RETRO_SIMD_NEON | RETRO_SIMD_ASIMD;
+#else
+	return 0;
+#endif
+}
+static retro_perf_tick_t perf_counter(void) { return diatom_port_now_us(); }
+static void perf_register(struct retro_perf_counter *c) { c->registered = true; }
+static void perf_nothing(struct retro_perf_counter *c) { (void)c; }
+static void perf_log(void) {}
+
 static bool env_cb(unsigned cmd, void *data)
 {
+	if (cmd == RA_GET_CLEAR_ALL_THREAD_WAITS_CB) {
+		*(retro_environment_t *)data = clear_thread_waits;
+		return true;
+	}
 	switch (MASK(cmd)) {
 
 	/* ---- video ---------------------------------------------------------- */
@@ -246,6 +286,18 @@ static bool env_cb(unsigned cmd, void *data)
 	case MASK(RETRO_ENVIRONMENT_SET_HW_RENDER):
 		/* A core that draws with the GPU. See hw.c. */
 		return diatom_hw_request(data, g_caps);
+	case MASK(RETRO_ENVIRONMENT_GET_PERF_INTERFACE): {
+		struct retro_perf_callback *p = data;
+
+		p->get_time_usec    = perf_time_usec;
+		p->get_cpu_features = perf_cpu_features;
+		p->get_perf_counter = perf_counter;
+		p->perf_register    = perf_register;
+		p->perf_start       = perf_nothing;
+		p->perf_stop        = perf_nothing;
+		p->perf_log         = perf_log;
+		return true;
+	}
 	case MASK(RETRO_ENVIRONMENT_GET_FASTFORWARDING):
 		/* flycast2021 asks every frame and, with threaded rendering, makes
 		 * its sound only while the answer is no; unanswered, it made none at

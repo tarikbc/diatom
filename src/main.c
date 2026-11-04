@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "cheevos.h"
@@ -395,6 +396,60 @@ static void on_crash(int sig)
 	raise(sig);
 }
 
+/* Where it died, for whoever reads the log: the faulting address, the
+ * instruction, and the executable mappings to place it in a library. All of
+ * it with write(), open() and read(), which are async-signal-safe; formatting
+ * is by hand for the same reason. A crash that came with nothing but its
+ * signal's name (flycast2021 leaving a game, SIGBUS, 2026-11-04) is what this
+ * is for. */
+static void crash_hex(const char *label, uintptr_t v)
+{
+	char buf[64];
+	size_t n = 0, i;
+	int shift;
+
+	for (i = 0; label[i] && n < 40; i++) buf[n++] = label[i];
+	buf[n++] = '0';
+	buf[n++] = 'x';
+	for (shift = (int)sizeof v * 8 - 4; shift >= 0; shift -= 4)
+		buf[n++] = "0123456789abcdef"[(v >> shift) & 15];
+	buf[n++] = '\n';
+	if (write(2, buf, n) < 0) { /* nothing to do about it here */ }
+}
+
+static void crash_where(siginfo_t *si, void *uc)
+{
+	char chunk[4096], line[512];
+	size_t len = 0;
+	ssize_t got;
+	int fd, i;
+
+	crash_hex("diatom: crash at ", (uintptr_t)si->si_addr);
+#if defined(__aarch64__)
+	crash_hex("diatom: pc ", (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc);
+	crash_hex("diatom: lr ", (uintptr_t)((ucontext_t *)uc)->uc_mcontext.regs[30]);
+#else
+	(void)uc;
+#endif
+	if ((fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC)) < 0) return;
+	while ((got = read(fd, chunk, sizeof chunk)) > 0)
+		for (i = 0; i < got; i++) {
+			if (len < sizeof line - 1) line[len++] = chunk[i];
+			if (chunk[i] != '\n') continue;
+			/* the executable ones only: "r-xp" at the permissions */
+			if (len > 30 && memchr(line, 'x', len < 40 ? len : 40))
+				if (write(2, line, len) < 0) { /* as above */ }
+			len = 0;
+		}
+	close(fd);
+}
+
+static void on_crash_info(int sig, siginfo_t *si, void *uc)
+{
+	crash_where(si, uc);
+	on_crash(sig);
+}
+
 /* A core that calls exit() on a fatal error - some do - raises no signal, so
  * the handler above never runs and the launcher would wait forever on a
  * process that has already gone. Not signal context, so the ordinary send is
@@ -443,8 +498,8 @@ static void install_crash_handlers(void)
 	sigaltstack(&ss, NULL);
 
 	memset(&sa, 0, sizeof sa);
-	sa.sa_handler = on_crash;
-	sa.sa_flags   = SA_ONSTACK;
+	sa.sa_sigaction = on_crash_info;
+	sa.sa_flags     = SA_ONSTACK | SA_SIGINFO;
 	/* Block everything for the duration: a second fault inside the handler
 	 * then cannot re-enter it, and the kernel kills us outright instead. That
 	 * is the right outcome - it is already the second failure. */
@@ -596,13 +651,22 @@ static bool g_audio_fast;
 #define FOREIGN_POLL_US 2000
 static pthread_t g_host_thread;
 static size_t    g_foreign_high;       /* three quarters of the device's queue; 0 none */
+static volatile bool g_foreign_held = true;   /* false while the core ends its threads */
+
+/* The core's clear-waits callback (env.c): false lets go of a thread held for
+ * the speaker, while the core winds its threads down at unload. */
+void diatom_audio_hold_waits(bool hold)
+{
+	g_foreign_held = hold;
+}
 
 static void foreign_pace(void)
 {
 	unsigned waited = 0;
 
-	if (!g_foreign_high || g_audio_fast) return;
-	while (diatom_port_audio_queued() > g_foreign_high && waited < FOREIGN_WAIT_US) {
+	if (!g_foreign_high || g_audio_fast || !g_foreign_held) return;
+	while (g_foreign_held && diatom_port_audio_queued() > g_foreign_high &&
+	       waited < FOREIGN_WAIT_US) {
 		usleep(FOREIGN_POLL_US);
 		waited += FOREIGN_POLL_US;
 	}
@@ -1693,7 +1757,11 @@ static int run_session_inner(const diatom_session *sn)
 	 * to load is not an error, it just means the game starts normally. That
 	 * fallback is what makes resume-by-default safe across a core update. */
 	diatom_save_init(g_core, g_policy.save_dir, sn->rom);
-	if (sn->state_load && !diatom_state_load(g_core, sn->state_load))
+	/* Not yet for a core that draws with the GPU: flycast2021 runs its
+	 * machine on a thread that starts with the first frame, and refuses a
+	 * state before then, so a game never resumed. Its state goes in after the
+	 * warmup, below. */
+	if (sn->state_load && !diatom_hw_active() && !diatom_state_load(g_core, sn->state_load))
 		printf("diatom: no usable state at %s; starting the game normally\n",
 		       sn->state_load);
 
@@ -1728,6 +1796,7 @@ static int run_session_inner(const diatom_session *sn)
 
 		diatom_audio_configure(audio_rate, g_caps.audio_rate, cap);
 		g_foreign_high = (size_t)cap * 3 / 4;
+		g_foreign_held = true;
 	}
 	diatom_audio_prime();
 
@@ -1870,6 +1939,9 @@ static int run_session_inner(const diatom_session *sn)
 		printf("diatom: warmup 3 frames in %.1f ms\n",
 		       (diatom_port_now_us() - w0) / 1000.0);
 	}
+	if (sn->state_load && diatom_hw_active() && !diatom_state_load(g_core, sn->state_load))
+		printf("diatom: no usable state at %s; starting the game normally\n",
+		       sn->state_load);
 
 	t_start = diatom_port_now_us();
 	next_us = (double)t_start;

@@ -138,17 +138,19 @@ bool diatom_env_frame_skippable(void);
 /* hw.c - a core that draws with the GPU (libretro's hardware rendering).
  * _request answers SET_HW_RENDER; _load_begin forgets the last game's ask;
  * _start brings the context up after a successful load and tells the core;
- * _unload_begin and _unload_end bracket retro_unload_game. While _active, the
- * core's frames are the port's GPU frames, not pixels. */
+ * _unload, after retro_unload_game, tells the core the context is going and
+ * takes it down. While _active, the core's frames are the port's GPU frames,
+ * not pixels. */
 bool diatom_hw_request(struct retro_hw_render_callback *cb, const diatom_port_caps *caps);
 void diatom_hw_load_begin(void);
 bool diatom_hw_start(diatom_core *c);
-void diatom_hw_unload_begin(void);
-void diatom_hw_unload_end(void);
+void diatom_hw_unload(void);
 bool diatom_hw_active(void);
 /* main.c, for env.c: whether frames are being run faster than they are
- * shown. */
+ * shown; and whether a core's own sound thread may be held for the speaker
+ * (false while the core ends its threads, RetroArch's clear-waits). */
 bool diatom_fast_forwarding(void);
+void diatom_audio_hold_waits(bool hold);
 
 /* options.c - what a core can be configured with, and what it currently is.
  *
