@@ -246,6 +246,12 @@ static bool env_cb(unsigned cmd, void *data)
 	case MASK(RETRO_ENVIRONMENT_SET_HW_RENDER):
 		/* A core that draws with the GPU. See hw.c. */
 		return diatom_hw_request(data, g_caps);
+	case MASK(RETRO_ENVIRONMENT_GET_FASTFORWARDING):
+		/* flycast2021 asks every frame and, with threaded rendering, makes
+		 * its sound only while the answer is no; unanswered, it made none at
+		 * all. */
+		if (data) *(bool *)data = diatom_fast_forwarding();
+		return true;
 	case MASK(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER):
 		/* OpenGL ES 3, which runs an ES 2 core too. Asked before the core
 		 * says which it wants; a port with no GPU frames prefers none. */

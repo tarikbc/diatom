@@ -578,8 +578,54 @@ static bool g_audio_warmup;
  * loop pushes silence for the time each fast turn stands for. */
 static bool g_audio_fast;
 
+/* A core that makes its sound on a thread of its own pushes it from there:
+ * flycast2021's threaded rendering does, from its emulation thread. audio.c
+ * takes a lock for it.
+ *
+ * And it is that thread's pace. Nothing else holds it back - RetroArch's
+ * sound write blocks, which is what holds it there - and unheld it ran
+ * Crazy Taxi 2 31% fast, its sound dropped by the second and frames it had
+ * no time to hand over thrown away (2026-11-04). So it waits while the
+ * device's queue is over three quarters full, which holds the game to the
+ * speaker's rate: the queue drains on its own, whatever the frame loop is
+ * doing. (Held to sound the frame loop moved, it waited on a frame that was
+ * waiting on it: 72% of real time.) Never past a bound, so a stopped device
+ * only loses that thread some sound. Not in fast forward, which is meant to
+ * outrun the speaker; the loop pushes silence then. */
+#define FOREIGN_WAIT_US 100000
+#define FOREIGN_POLL_US 2000
+static pthread_t g_host_thread;
+static size_t    g_foreign_high;       /* three quarters of the device's queue; 0 none */
+
+static void foreign_pace(void)
+{
+	unsigned waited = 0;
+
+	if (!g_foreign_high || g_audio_fast) return;
+	while (diatom_port_audio_queued() > g_foreign_high && waited < FOREIGN_WAIT_US) {
+		usleep(FOREIGN_POLL_US);
+		waited += FOREIGN_POLL_US;
+	}
+}
+
 void diatom_on_audio_batch_store(const int16_t *data, size_t frames)
 {
+	if (!pthread_equal(pthread_self(), g_host_thread)) {
+		foreign_pace();
+		if (getenv("DIATOM_AUDIO_DEBUG")) {
+			static uint64_t since, got;
+			uint64_t now = diatom_port_now_us();
+
+			got += frames;
+			if (!since) since = now;
+			if (now - since >= 2000000) {
+				printf("diatom: %.0f sound frames a second from the core's thread, queue %zu\n",
+				       got * 1e6 / (double)(now - since), diatom_port_audio_queued());
+				got = 0;
+				since = now;
+			}
+		}
+	}
 	if (g_audio_fast) return;    /* the frame loop pushes silence instead */
 	diatom_audio_note_input(data, frames);
 	if (g_audio_warmup) return;
@@ -750,6 +796,12 @@ static void idle_note_input(bool any)
  * exit summary's figure for stretch, 6.6 to 7.0 ms, rounded up. */
 #define FAST_PRESENT_GUESS_US 7000.0
 static int  g_speed = 1;
+
+/* For a core that asks (GET_FASTFORWARDING, env.c) */
+bool diatom_fast_forwarding(void)
+{
+	return g_speed > 1;
+}
 
 /* A Super Game Boy's clock is the SNES's, 2.4% faster than a Game Boy's, and
  * mGBA, running an SGB-flagged game as one (in the GBC folder, where the model
@@ -1671,8 +1723,12 @@ static int run_session_inner(const diatom_session *sn)
 	if (audio_rate != av.timing.sample_rate)
 		printf("diatom: Super Game Boy timing: resampling from %.0f Hz, "
 		       "not the %.0f Hz announced\n", audio_rate, av.timing.sample_rate);
-	diatom_audio_configure(audio_rate, g_caps.audio_rate,
-	                       diatom_port_audio_start() ? g_caps.audio_buffer_frames : 0);
+	{
+		int cap = diatom_port_audio_start() ? g_caps.audio_buffer_frames : 0;
+
+		diatom_audio_configure(audio_rate, g_caps.audio_rate, cap);
+		g_foreign_high = (size_t)cap * 3 / 4;
+	}
 	diatom_audio_prime();
 
 	/* The rect is computed from BASE geometry and does not move again unless
@@ -2445,6 +2501,8 @@ static int run_session(const diatom_session *sn)
 int main(int argc, char **argv)
 {
 	const char *core_path = NULL, *rom_path = NULL, *shot_path = NULL;
+
+	g_host_thread = pthread_self();
 	/* Stretch by default, judged on the panel. A handheld's screen
 	 * is its whole interface, and full use of it beat both the letterbox and
 	 * the crop. nearest because sharp earned nothing visible at these factors

@@ -199,8 +199,10 @@ typedef struct {
 
 bool  diatom_port_gpu_begin(const diatom_gpu_spec *spec);
 void  diatom_port_gpu_end(void);
-/* The framebuffer to draw this frame into, as a GL name. The same name until
- * present_gpu takes the frame, so a core may ask as often as it likes. */
+/* The framebuffer to draw into, as a GL name: always the same one, with the
+ * frame's own texture put under it here. The host calls it before every
+ * frame, since a core may read the name once and keep it; a core may also
+ * ask as often as it likes. */
 uintptr_t diatom_port_gpu_target(void);
 void *diatom_port_gpu_proc(const char *name);
 /* The frame just drawn: w x h at the framebuffer's bottom-left corner, GL's

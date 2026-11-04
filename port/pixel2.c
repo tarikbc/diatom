@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "diatom_port.h"
@@ -117,6 +118,7 @@ typedef struct {
 	GLuint        gpu_tex;
 	int           tex_w, tex_h;
 	EGLSyncKHR    fence;
+	unsigned      seq;          /* present_gpu's count, for the turn-taking */
 } mailbox_frame;
 
 static mailbox_frame    g_frames[MAILBOX_FRAMES];
@@ -148,10 +150,17 @@ static diatom_pixfmt g_tex_fmt;
 
 /* A core that draws with the GPU (diatom_port_gpu_begin) gets a context of its
  * own on the host's thread, sharing textures with the thread's, and one
- * framebuffer per mailbox slot: slot i draws into texture g_gpu_tex[i], so a
- * GPU frame takes the same roles a pixel frame does (front, inflight,
- * pending), and the texture of a slot holding a role is never drawn into.
- * Framebuffers are the core context's own; only the textures are shared.
+ * texture per mailbox slot: slot i draws into texture g_gpu_tex[i], so a GPU
+ * frame takes the same roles a pixel frame does (front, inflight, pending),
+ * and the texture of a slot holding a role is never drawn into.
+ *
+ * ONE framebuffer for all of them, its texture swapped under it as the slots
+ * turn. A core may read the framebuffer's name once and keep it: libretro's
+ * GL state manager (glsm, which flycast2021 uses) takes it at context_reset
+ * and binds that name every frame after. With a framebuffer per slot that
+ * core drew every frame into slot 0's and the panel showed the others, black
+ * (2026-11-04). Framebuffers are the core context's own; only the textures
+ * are shared.
  *
  * Two fences keep the two contexts apart. present_gpu leaves one after the
  * core's drawing, which the thread waits on before sampling (the frame's
@@ -160,11 +169,20 @@ static diatom_pixfmt g_tex_fmt;
  * it has nearly always passed: the slot was free, so the thread is two frames
  * on. */
 static EGLContext g_gpu_ctx = EGL_NO_CONTEXT;
-static GLuint     g_gpu_tex[MAILBOX_FRAMES], g_gpu_fbo[MAILBOX_FRAMES], g_gpu_depth;
+static GLuint     g_gpu_tex[MAILBOX_FRAMES], g_gpu_depth;
+static GLuint     g_gpu_fb;                      /* the core draws into this one */
+static GLuint     g_gpu_read_fb;                 /* gpu_read's, for any slot */
+static int        g_gpu_attached = -1;           /* the slot whose texture g_gpu_fb holds */
 static EGLSyncKHR g_gpu_done[MAILBOX_FRAMES];    /* under g_mx */
 static int        g_gpu_w, g_gpu_h;
 static int        g_gpu_drawing = -1;            /* the slot the core draws into; under g_mx */
 static int        g_gpu_last = -1;               /* the slot of the last GPU frame presented */
+/* The end of the core's last frame on the GPU, for present_gpu's throttle */
+static EGLSyncKHR g_gpu_throttle = EGL_NO_SYNC_KHR;
+/* Turn-taking on the GPU (gpu_target): the last GPU frame presented, and the
+ * last one the thread has drawn to the panel, by present_gpu's count. Under
+ * g_mx. */
+static unsigned   g_gpu_seq, g_gpu_blitted;
 
 static PFNEGLCREATESYNCKHRPROC     p_create_sync;
 static PFNEGLDESTROYSYNCKHRPROC    p_destroy_sync;
@@ -1248,6 +1266,22 @@ static void *present_thread(void *arg)
 
 		if (g_present_debug) t0 = diatom_port_now_us();
 		gpu_frame_ready(&g_frames[frame]);
+		if (g_present_debug && g_frames[frame].gpu) {
+			static uint64_t waited, last;
+			static int n;
+			uint64_t t = diatom_port_now_us();
+
+			waited += t - t0;
+			if (++n >= 60) {
+				port_logf(DIATOM_LOG_INFO, "present: 60 GPU frames in %llu ms, %llu ms of it "
+				          "waiting for the core's drawing",
+				          (unsigned long long)((t - last) / 1000),
+				          (unsigned long long)(waited / 1000));
+				n = 0;
+				waited = 0;
+				last = t;
+			}
+		}
 		upload_frame(&g_frames[frame]);
 		draw_scene(&g_frames[frame], ov_live, osd_live, osd_kind, osd_level,
 		           osd_max, lowbat, g_turned);
@@ -1255,6 +1289,14 @@ static void *present_thread(void *arg)
 		 * it: a fence for diatom_port_gpu_target to wait on. */
 		done = g_frames[frame].gpu
 		     ? p_create_sync(g_egl_display, EGL_SYNC_FENCE_KHR, NULL) : EGL_NO_SYNC_KHR;
+		if (g_frames[frame].gpu) {
+			/* Drawn and on its way: the core may start its next frame */
+			glFlush();
+			pthread_mutex_lock(&g_mx);
+			g_gpu_blitted = g_frames[frame].seq;
+			pthread_cond_broadcast(&g_idle);
+			pthread_mutex_unlock(&g_mx);
+		}
 		eglSwapBuffers(g_egl_display, g_egl_surface);
 		if (g_present_debug) {
 			static int n;
@@ -1429,7 +1471,6 @@ bool diatom_port_gpu_begin(const diatom_gpu_spec *spec)
 		                      g_gpu_w, g_gpu_h);
 	}
 	glGenTextures(MAILBOX_FRAMES, g_gpu_tex);
-	glGenFramebuffers(MAILBOX_FRAMES, g_gpu_fbo);
 	for (i = 0; i < MAILBOX_FRAMES; i++) {
 		glBindTexture(GL_TEXTURE_2D, g_gpu_tex[i]);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1438,16 +1479,21 @@ bool diatom_port_gpu_begin(const diatom_gpu_spec *spec)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_gpu_w, g_gpu_h, 0,
 		             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-		glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_fbo[i]);
+	}
+	glGenFramebuffers(1, &g_gpu_read_fb);
+	glGenFramebuffers(1, &g_gpu_fb);
+	glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_fb);
+	/* Depth and stencil apart, which OpenGL ES 2 takes as well as 3 */
+	if (g_gpu_depth)
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+		                          GL_RENDERBUFFER, g_gpu_depth);
+	if (g_gpu_depth && spec->stencil)
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+		                          GL_RENDERBUFFER, g_gpu_depth);
+	/* Each slot's texture through it once: cleared, and checked complete */
+	for (i = 0; i < MAILBOX_FRAMES; i++) {
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
 		                       g_gpu_tex[i], 0);
-		/* Depth and stencil apart, which OpenGL ES 2 takes as well as 3 */
-		if (g_gpu_depth)
-			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-			                          GL_RENDERBUFFER, g_gpu_depth);
-		if (g_gpu_depth && spec->stencil)
-			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
-			                          GL_RENDERBUFFER, g_gpu_depth);
 		glClearColor(0, 0, 0, 1);
 		glClear(GL_COLOR_BUFFER_BIT);
 		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
@@ -1456,12 +1502,14 @@ bool diatom_port_gpu_begin(const diatom_gpu_spec *spec)
 			return false;
 		}
 	}
+	g_gpu_attached = MAILBOX_FRAMES - 1;
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glBindTexture(GL_TEXTURE_2D, 0);
 	glFinish();
 
 	pthread_mutex_lock(&g_mx);
 	g_gpu_drawing = -1;
+	g_gpu_seq = g_gpu_blitted = 0;
 	pthread_mutex_unlock(&g_mx);
 	g_gpu_last = -1;
 	port_logf(DIATOM_LOG_INFO, "pixel2: GPU frames on OpenGL ES %d, up to %dx%d%s%s",
@@ -1491,14 +1539,19 @@ void diatom_port_gpu_end(void)
 	g_gpu_drawing = -1;
 	pthread_mutex_unlock(&g_mx);
 	g_gpu_last = -1;
+	if (g_gpu_throttle != EGL_NO_SYNC_KHR) {
+		p_destroy_sync(g_egl_display, g_gpu_throttle);
+		g_gpu_throttle = EGL_NO_SYNC_KHR;
+	}
 
 	eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, g_gpu_ctx);
-	glDeleteFramebuffers(MAILBOX_FRAMES, g_gpu_fbo);
+	glDeleteFramebuffers(1, &g_gpu_fb);
+	glDeleteFramebuffers(1, &g_gpu_read_fb);
 	glDeleteTextures(MAILBOX_FRAMES, g_gpu_tex);
 	if (g_gpu_depth) glDeleteRenderbuffers(1, &g_gpu_depth);
-	memset(g_gpu_fbo, 0, sizeof g_gpu_fbo);
 	memset(g_gpu_tex, 0, sizeof g_gpu_tex);
-	g_gpu_depth = 0;
+	g_gpu_fb = g_gpu_read_fb = g_gpu_depth = 0;
+	g_gpu_attached = -1;
 	eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 	eglDestroyContext(g_egl_display, g_gpu_ctx);
 	g_gpu_ctx = EGL_NO_CONTEXT;
@@ -1512,6 +1565,20 @@ uintptr_t diatom_port_gpu_target(void)
 	if (g_gpu_ctx == EGL_NO_CONTEXT) return 0;
 	pthread_mutex_lock(&g_mx);
 	if (g_gpu_drawing < 0) {
+		/* Turn-taking: the next frame starts once the thread has drawn the
+		 * last one to the panel. The GPU runs one job after another, so a
+		 * frame begun earlier went ahead of the thread's small one, and the
+		 * panel waited behind the core: Crazy Taxi 2's 27 frames a second
+		 * reached it as 11 (2026-11-04). Bounded, so a thread that stopped
+		 * drawing cannot hold the core for good. */
+		struct timespec until;
+
+		clock_gettime(CLOCK_REALTIME, &until);
+		until.tv_nsec += 200 * 1000000L;
+		if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+		while (g_thread_running && g_gpu_blitted != g_gpu_seq)
+			if (pthread_cond_timedwait(&g_idle, &g_mx, &until) == ETIMEDOUT) break;
+
 		for (i = 0; i < MAILBOX_FRAMES; i++)
 			if (i != g_front && i != g_inflight && i != g_pending) break;
 		if (i == MAILBOX_FRAMES) {      /* all three taken: the newest wins */
@@ -1526,7 +1593,18 @@ uintptr_t diatom_port_gpu_target(void)
 	i = g_gpu_drawing;
 	pthread_mutex_unlock(&g_mx);
 	wait_sync(done);
-	return g_gpu_fbo[i];
+	if (i != g_gpu_attached) {
+		/* The core's own binding put back: its state cache expects it */
+		GLint prev = 0;
+
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+		glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_fb);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+		                       g_gpu_tex[i], 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev);
+		g_gpu_attached = i;
+	}
+	return g_gpu_fb;
 }
 
 void *diatom_port_gpu_proc(const char *name)
@@ -1537,7 +1615,7 @@ void *diatom_port_gpu_proc(const char *name)
 void diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter)
 {
 	mailbox_frame *f;
-	EGLSyncKHR fence;
+	EGLSyncKHR fence, throttle;
 	int i;
 
 	if (g_gpu_ctx == EGL_NO_CONTEXT || w <= 0 || h <= 0 || !g_thread_running) return;
@@ -1551,7 +1629,35 @@ void diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter
 	/* Into the core's command stream after its drawing, and flushed: the
 	 * thread's wait flushes only its own context. */
 	fence = p_create_sync(g_egl_display, EGL_SYNC_FENCE_KHR, NULL);
+	throttle = p_create_sync(g_egl_display, EGL_SYNC_FENCE_KHR, NULL);
 	glFlush();
+	/* And no further ahead of the GPU than one frame: the previous frame
+	 * must be done before the core starts the next. Nothing else holds it
+	 * back - RetroArch's swap does that there - and a core that queued
+	 * frames faster than the GPU drew them had every frame drawn and only
+	 * the newest shown, behind all the rest: Crazy Taxi 2 queued about 37 a
+	 * second and the panel showed 6 (2026-11-04). */
+	if (g_present_debug) {
+		static uint64_t waited, last;
+		static int n;
+		uint64_t t0 = diatom_port_now_us(), t1;
+
+		wait_sync(g_gpu_throttle);
+		t1 = diatom_port_now_us();
+		waited += t1 - t0;
+		if (++n >= 60) {
+			port_logf(DIATOM_LOG_INFO, "present: the core drew 60 frames in %llu ms, "
+			          "%llu ms of it waiting for the GPU",
+			          (unsigned long long)((t1 - last) / 1000),
+			          (unsigned long long)(waited / 1000));
+			n = 0;
+			waited = 0;
+			last = t1;
+		}
+	} else {
+		wait_sync(g_gpu_throttle);
+	}
+	g_gpu_throttle = throttle;
 
 	{
 		static int lw = -1, lh = -1;
@@ -1575,6 +1681,7 @@ void diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter
 	f->dst = dst;
 	f->filter = filter;
 	f->fence = fence;
+	f->seq = g_gpu_seq + 1;         /* g_gpu_seq is this thread's alone to change */
 	f->nplanes = g_nplanes;
 	if (g_nplanes) memcpy(f->planes, g_planes, sizeof g_planes[0] * (size_t)g_nplanes);
 	g_gpu_last = i;
@@ -1584,6 +1691,7 @@ void diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter
 	g_presented = true;
 	g_pending = i;
 	g_gpu_drawing = -1;
+	g_gpu_seq++;
 	pthread_cond_signal(&g_cv);
 	pthread_mutex_unlock(&g_mx);
 }
@@ -1608,7 +1716,9 @@ bool diatom_port_gpu_read(void *xrgb, int *w, int *h, size_t cap)
 	 * expect them to move between frames. */
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fb);
 	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_align);
-	glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_fbo[g_gpu_last]);
+	glBindFramebuffer(GL_FRAMEBUFFER, g_gpu_read_fb);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+	                       g_gpu_tex[g_gpu_last], 0);
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 	glReadPixels(0, 0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 	glPixelStorei(GL_PACK_ALIGNMENT, prev_align);

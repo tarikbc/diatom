@@ -146,6 +146,9 @@ bool diatom_hw_start(diatom_core *c);
 void diatom_hw_unload_begin(void);
 void diatom_hw_unload_end(void);
 bool diatom_hw_active(void);
+/* main.c, for env.c: whether frames are being run faster than they are
+ * shown. */
+bool diatom_fast_forwarding(void);
 
 /* options.c - what a core can be configured with, and what it currently is.
  *

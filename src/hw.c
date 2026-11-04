@@ -22,6 +22,22 @@ static struct retro_hw_render_callback g_hw;
 static bool g_asked;            /* this load asked for the GPU */
 static bool g_live;             /* the context is up and the core was told */
 
+/* The core's own retro_run, while hw_run stands in for it */
+static diatom_core *g_core;
+static void       (*g_core_run)(void);
+
+/* In place of the core's retro_run while its context is up, so every place
+ * that runs a frame (the loop, the warmup, fast forward) does this too.
+ *
+ * Before the frame: its texture under the framebuffer. A core may read the
+ * framebuffer's name once and never ask again (glsm does), so the turn to
+ * the next texture has to come from here. */
+static void hw_run(void)
+{
+	diatom_port_gpu_target();
+	g_core_run();
+}
+
 static uintptr_t hw_framebuffer(void)
 {
 	return diatom_port_gpu_target();
@@ -80,6 +96,9 @@ bool diatom_hw_start(diatom_core *c)
 		return false;
 	}
 	g_live = true;
+	g_core = c;
+	g_core_run = c->run;
+	c->run = hw_run;
 	if (g_hw.context_reset) g_hw.context_reset();
 	return true;
 }
@@ -95,6 +114,8 @@ void diatom_hw_unload_end(void)
 {
 	if (!g_live) return;
 	diatom_port_gpu_end();
+	g_core->run = g_core_run;
+	g_core = NULL;
 	g_live = false;
 	g_asked = false;
 }
