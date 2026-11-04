@@ -355,7 +355,7 @@ bool diatom_state_save(diatom_core *c, const char *path)
  * WHY IT EXISTS. libretro's mGBA segfaults on every MBC2 Game Boy cartridge -
  * a regression in mgba a1b2b23, reported as mgba-emu/mgba#3859 and fixed
  * upstream the same day in 543a1975. That fix is in no downloadable core:
- * libretro builds from its own fork, unsynced since 2026-08-06. TortOS
+ * libretro builds from its own fork, unsynced since 2026-08-06. ZyperOS
  * therefore ships a bridge build - libretro's tree at the pinned commit plus
  * upstream's own one-hunk fix - and it reports `0.11.0` rather than
  * `0.11-219-e31759b` only because there is no git in the build container.
@@ -373,10 +373,10 @@ bool diatom_state_save(diatom_core *c, const char *path)
  * version in it.
  *
  * WHEN TO REMOVE IT: as soon as github.com/libretro/mgba carries 543a1975 and
- * TortOS goes back to the fetched core. Then this table is not merely dead, it
+ * ZyperOS goes back to the fetched core. Then this table is not merely dead, it
  * is WRONG - it would let a genuinely foreign state through. Delete the table,
  * delete version_twins, and restore the plain strcmp above, at the same time
- * as TortOS deletes its mk/build-mgba-bridge.sh. */
+ * as ZyperOS deletes its mk/build-mgba-bridge.sh. */
 static const struct { const char *a, *b; } STATE_TWINS[] = {
 	{ "0.11.0", "0.11-219-e31759b" },   /* the MBC2 bridge, and what it patches */
 };

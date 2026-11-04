@@ -75,7 +75,7 @@ static void step(diatom_level_kind kind, int dir)
 	diatom_port_level_shown(kind, pos, positions);
 }
 
-/* Holding a level key repeats it at the launcher's pace - TortOS's
+/* Holding a level key repeats it at the launcher's pace - ZyperOS's
  * REPEAT_DELAY_MS and REPEAT_RATE_MS, 300 and 90 - so a hold does the same thing
  * in a game as at the shelf. */
 #define REPEAT_DELAY_US 300000ull
