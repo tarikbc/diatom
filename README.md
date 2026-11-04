@@ -3,9 +3,11 @@
 </p>
 
 A minimal libretro frontend for low-power ARM Linux handhelds (~1GB RAM). It is
-the emulator behind [TortOS](https://github.com/ericreinsmidt/TortOS), which
+the emulator behind [ZyperOS](https://github.com/tarikbc/ZyperOS), which
 drives it over a Unix socket, and an open base for any other firmware that
-wants one.
+wants one. It began as Eric Reinsmidt's
+[diatom](https://github.com/ericreinsmidt/diatom), the emulator behind
+[TortOS](https://github.com/ericreinsmidt/TortOS), and keeps his notices.
 
 **Mozilla Public License 2.0** ([LICENSE](LICENSE)). Diatom's own files stay
 open: whoever changes them and shares the result shares their changes too. But
@@ -13,13 +15,13 @@ the license stops at Diatom's files, so Diatom can still host cores under any
 license - which is what `libretro.h` is permissive for - and it loads whatever
 core it is handed and ships none of them. It was MIT until 2026-10-25.
 
-**Status: running on hardware, shipping in TortOS.** Eleven systems across six
+**Status: running on hardware, shipping in ZyperOS.** Eleven systems across six
 cores on the TrimUI Brick and the GKD Pixel 2: NES · SNES · Genesis ·
 Master System · Game Gear · Game Boy · Game Boy Color · GBA · PC Engine
 (HuCard and CD) · Neo Geo Pocket · Neo Geo Pocket Color. All 2D, all digital input, all light
 enough to keep every core resident at once. Five of the cores are pinned and
 measured here ([CORES.md](CORES.md)); the sixth, `mednafen_ngp` for the two
-Pocket systems, is pinned by TortOS and not yet measured here.
+Pocket systems, is pinned by ZyperOS and not yet measured here.
 
     diatom --core snes9x2010_libretro.so --rom parodius.sfc
 
@@ -44,7 +46,7 @@ alone is a stricter test than designing for one embedder.
     make                        desktop (SDL2), for iteration
     make check                  the checks below; run before committing
 
-The devices' builds are [plastron](https://github.com/ericreinsmidt/plastron)'s:
+The devices' builds are [plastron](https://github.com/tarikbc/plastron)'s:
 its Buildroot builds Diatom for the TrimUI Brick and the GKD Pixel 2 with its
 own compiler and SDL2 (`PORT=brick` or `PORT=pixel2`, SDL2 found with
 pkg-config), from this working tree.

@@ -531,7 +531,7 @@ static void measure_cost(void)
  * NES launch after a GBA one segfaulted inside mGBA, every time, because a core
  * whose game has been unloaded dereferences what it has already freed.
  *
- * The bug is invisible from the launcher's side: TortOS sees the resident die,
+ * The bug is invisible from the launcher's side: ZyperOS sees the resident die,
  * falls back to running the game standalone, and the player just notices that
  * turbo stopped working. */
 static void test_no_game_no_questions(void)

@@ -177,7 +177,7 @@ struct dm_ctl_elem_value {
  * floor: level 10 of 20 landed on raw 31, about two and a half times the room,
  * which is what "50% and very quiet" is.
  *
- * TortOS's launcher already had this number - the sweep was done there and the
+ * ZyperOS's launcher already had this number - the sweep was done there and the
  * constant is GAIN_RAW_USABLE in its src/platform.c. The port carries its own
  * copy of the mapping because it owns the level while a game runs, and only one
  * of the two was corrected. Same measurement, same ceiling, so the bar means
@@ -263,7 +263,7 @@ static bool g_muted;
  * of its twenty steps above raw 128, where consecutive ones cannot be told
  * apart, and left raw 1-12 unreachable at any setting.
  *
- * The rungs are the launcher's own, read off TortOS's brightness keys, with two
+ * The rungs are the launcher's own, read off ZyperOS's brightness keys, with two
  * added below. Matching them is not deference: every value here except the
  * bottom two is one the launcher also has a level for, so a brightness set in a
  * game means the same thing on the other side of the exit instead of snapping
@@ -271,7 +271,7 @@ static bool g_muted;
  * protocol eventually; this is the standalone default.
  *
  * The first rung is the panel's measured floor - 0 and 1 are black, and the
- * driver clamps neither. TortOS's own bottom level is raw 1 and is deliberately
+ * driver clamps neither. ZyperOS's own bottom level is raw 1 and is deliberately
  * not copied. This table is also the only clamp there is: no arithmetic here
  * can produce a value off its ends. */
 static const unsigned char bright_ladder[] = {
@@ -533,7 +533,7 @@ static void draw_gain_bar(uint8_t *base)
 	const int pad = 3, bar = 6;
 	const int W = (int)g_vinfo.xres;
 	/* The launcher's two, so the bar means the same thing on the shelf and in
-	 * a game: UI_OSD_VOLUME and UI_OSD_BRIGHT in TortOS's src/ui.h. This was
+	 * a game: UI_OSD_VOLUME and UI_OSD_BRIGHT in ZyperOS's src/ui.h. This was
 	 * one hardcoded off-white for both, which made the in-game bar the only
 	 * place the color did not say which key you had pressed. */
 	const unsigned tint_r = g_osd_kind ? 255u :  61u;
@@ -587,7 +587,7 @@ static void clear_gain_bar(uint8_t *base, diatom_rect dst)
 }
 
 /* The low-battery disc: the launcher's, drawn the launcher's way so it reads
- * the same in a game as on the shelf (TortOS's draw_low_battery_dot):
+ * the same in a game as on the shelf (ZyperOS's draw_low_battery_dot):
  * horizontal spans of a disc of radius 9, centered 34 px from the top and
  * right edges. Like the bar it goes into the page after the blit, and when it
  * goes, what it covered outside the picture is put back to black - inside, the
@@ -1133,7 +1133,7 @@ void diatom_port_shutdown(void)
 	 * turning the volume up there could not undo it, so the machine simply
 	 * appeared to have lost its speaker.
 	 *
-	 * THAT REASONING EXPIRED on 2026-09-16. TortOS reads a hardware mute
+	 * THAT REASONING EXPIRED on 2026-09-16. ZyperOS reads a hardware mute
 	 * switch and drives this control itself, so the device is no longer
 	 * stranded by an off speaker - and handing it back unconditionally
 	 * would un-mute a device whose switch is still down, at the exact
@@ -1469,7 +1469,7 @@ void diatom_port_present(const void *src, int w, int h, size_t pitch,
 	/* Planes (a DS frame's two screens): this port's blit is one source rect
 	 * into one destination through prebuilt maps, so it draws the largest
 	 * plane and nothing else - one screen, never two garbled into one. The
-	 * Brick has no DS on TortOS; this only keeps the seam honest. */
+	 * Brick has no DS on ZyperOS; this only keeps the seam honest. */
 	if (src && g_nplanes > 0) {
 		const diatom_plane *p = &g_planes[0];
 		size_t bpp = fmt == DIATOM_PIX_RGB565 ? 2 : 4;

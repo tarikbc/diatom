@@ -186,7 +186,7 @@ struct dm_ctl_elem_value {
  * register's top: 0 is 255, 0 dB.
  *
  * Set by ear on 2026-10-02 with a game playing, the way the Brick's were; the
- * steps taken are in TortOS's src/device/pixel2.c. Speaker: level 20 on raw
+ * steps taken are in ZyperOS's src/device/pixel2.c. Speaker: level 20 on raw
  * 255, level 1 on raw 172, about 31 dB. Headphones (Apple EarPods): level 20
  * on raw 244, level 1 on raw 76, about 63 dB. The windows below are the ones
  * that land levels 1 and 20 exactly there with the rounding both sides share.
@@ -194,7 +194,7 @@ struct dm_ctl_elem_value {
  * Level 0 is raw 0, -95 dB, as the cut: the control has no switch. Whether
  * that is silent by ear is also unmeasured.
  *
- * Attenuation, not raw, because that is how TortOS's launcher holds it (its
+ * Attenuation, not raw, because that is how ZyperOS's launcher holds it (its
  * src/device/pixel2.c): its shared ladder arithmetic was written for the
  * Brick's inverted register, loud end low, and attenuation is that shape. The
  * same numbers and the same rounding on both sides, for the reason brick.c
@@ -208,11 +208,11 @@ struct dm_ctl_elem_value {
 
 /* A USB-C DAC's volume: "USB Playback Volume" on the codec's card, a software
  * volume that plastron's ALSA config puts in front of the DAC (its pcm.usb),
- * the DAC's own control set to full by the system. TortOS makes the control
+ * the DAC's own control set to full by the system. ZyperOS makes the control
  * at startup (its src/device/pixel2.c says why it can't be left to alsa-lib)
  * and writes it with every level; so does this, both controls each time, so a
  * DAC plugged in mid-game needs nothing re-applied. 0-255, 0.375 dB a step,
- * the codec's step; 0 is silence. The window is TortOS's, a starting guess
+ * the codec's step; 0 is silence. The window is ZyperOS's, a starting guess
  * from the EarPods' headphone window. Change one, change the other. */
 #define USB_CTL         "USB Playback Volume"
 #define USB_RAW_MAX     255
@@ -224,7 +224,7 @@ static int  g_mixer_fd = -1;
 static int  g_level = -1;           /* the position last read or written; -1 none */
 
 /* Backlight, /sys/class/backlight/backlight, 0-255, 0 is off. The same rungs
- * as TortOS's src/device/pixel2.c, which says how they were found: the device
+ * as ZyperOS's src/device/pixel2.c, which says how they were found: the device
  * tree's brightness-levels table sends 1 to 17 all to the same output, so the
  * Brick's rungs (2, 4, 8, 16) were four steps of one brightness. 17 is the
  * floor, and the panel went black below it (checked by eye 2026-10-02 on the
@@ -299,7 +299,7 @@ static void port_logf(diatom_log_level lvl, const char *fmt, ...)
  * In one pass, keeping the nodes it wants and closing only the rest (the power
  * key, which the launcher watches). Closing an evdev descriptor waits out an
  * RCU grace period in the kernel (evdev_detach_client), 10 to 50 ms each on
- * this device while the boot is busy; TortOS's scan of the same kind spent
+ * this device while the boot is busy; ZyperOS's scan of the same kind spent
  * about 190 ms of its startup in close(), measured 2026-10-02, and this port's
  * scan was the same shape - one per device, closing everything passed over. */
 static void input_scan(void)
@@ -661,7 +661,7 @@ static void draw_level_bar(int kind, int level, int max, bool turned)
 }
 
 /* The low-battery disc: the launcher's, in its place and color, as horizontal
- * spans so it matches TortOS's draw_low_battery_dot to the pixel: radius 9,
+ * spans so it matches ZyperOS's draw_low_battery_dot to the pixel: radius 9,
  * centered 34 px from the top and right edges of the surface. */
 static void draw_low_battery(bool turned)
 {
@@ -1471,7 +1471,7 @@ static void input_open(void)
 }
 
 /* The two volume keys, as level keys. What a key is, volume or brightness under
- * MENU, is settled when it goes down and kept while it is held, as TortOS keeps
+ * MENU, is settled when it goes down and kept while it is held, as ZyperOS keeps
  * it, so letting go of MENU mid-hold does not turn brightness into volume. A
  * press is latched until the host has read it, so a tap between two frames
  * counts; a key the events say is held is checked against the kernel, so a

@@ -7,7 +7,7 @@
  * as it is (0 loudest), the GKD Pixel 2's as attenuation from its top (255 - raw).
  * `levels` is the highest position, one less than the number of positions.
  *
- * The same rounding as TortOS's aout_level_to_raw, both ways, so a position
+ * The same rounding as ZyperOS's aout_level_to_raw, both ways, so a position
  * read back lands where it was written, and a level that crosses the socket
  * means the same register value on both sides. */
 #ifndef DIATOM_PORT_LADDER_H

@@ -35,7 +35,7 @@
 #   - a failed fetch `continue`d past the manifest write, dropping that row, and
 #     the run still exited 0.
 #
-# TortOS's mk/fetch-vendor.sh met the same event correctly, because its hashes
+# ZyperOS's mk/fetch-vendor.sh met the same event correctly, because its hashes
 # are literals in the script and a mismatch stops it. That is the shape adopted
 # here. The pin is the table below; CORES.md is generated FROM that table rather
 # than from whatever came down the wire, so the two cannot drift and no run can
@@ -67,7 +67,7 @@ MANIFEST=CORES.md
 # off TrimUI's firmware.
 #
 # To adopt a republished core: decide to, rather than letting a fetch decide for
-# you. Then change the line here AND in TortOS's mk/fetch-vendor.sh together,
+# you. Then change the line here AND in ZyperOS's mk/fetch-vendor.sh together,
 # and re-measure every row in docs/reference/core-facts.md that used it, because
 # each of those numbers was made against the old bytes.
 #
@@ -146,7 +146,7 @@ for c in $CORES; do
 		echo "    want $want" >&2
 		echo "    got  $got" >&2
 		echo "  The buildbot republished this core. Verify it, then update the" >&2
-		echo "  hash here and in TortOS's mk/fetch-vendor.sh together, and" >&2
+		echo "  hash here and in ZyperOS's mk/fetch-vendor.sh together, and" >&2
 		echo "  re-measure the core-facts.md rows that used it." >&2
 		exit 1
 	fi

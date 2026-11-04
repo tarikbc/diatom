@@ -117,7 +117,7 @@ bool diatom_core_open(diatom_core *c, const char *path)
  * removed, so a pointer handed out stays good after the lock is let go.
  */
 /* Sixteen since 2026-11-03. Eight held the six console cores with room to
- * spare, and the four small systems TortOS added that day (Atari 2600, Atari
+ * spare, and the four small systems ZyperOS added that day (Atari 2600, Atari
  * 7800, Game & Watch, arcade) made ten. The premap fills the registry in
  * readdir order, and in a container on 2026-11-03 the eight it held left out
  * mgba and genesis_plus_gx: "core registry full" twice at boot, so every
@@ -235,7 +235,7 @@ static bool read_file(const char *path, void **out, size_t *len)
  * libretro has a flag for exactly this, block_extract, and FinalBurn Neo and
  * MAME 2003-Plus both set it. A core that lists zip among its own extensions
  * says the same thing another way, and is taken at its word too. No console
- * core TortOS ships does either - read from each one's retro_system_info on
+ * core ZyperOS ships does either - read from each one's retro_system_info on
  * 2026-11-03, and Stella 2014, ProSystem and Game & Watch neither - so they
  * keep the extraction. */
 static bool takes_archives(const struct retro_system_info *si)

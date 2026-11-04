@@ -137,7 +137,7 @@ static bool show_overlay(const char *path, unsigned ms)
  * it never contains the OSD bar or a menu, and it needs nothing from the port
  * - the host already holds the last frame for dupe handling. minarch's
  * previews are small for the same reason a launcher cares: it decodes one per
- * visible card, on a shelf of dozens. BMP because that is what TortOS already
+ * visible card, on a shelf of dozens. BMP because that is what ZyperOS already
  * reads, top-down rows because that is what BMP wants for a positive height...
  * negative height, rather - top-down needs biHeight < 0, and getting that
  * wrong renders every card upside down. */
@@ -624,7 +624,7 @@ static void apply_display(int mode, diatom_filter filter)
 	 *
 	 * `surface=` says what the rect is measured in. A launcher that draws at
 	 * another size scales the rect to its own: on the GKD Pixel 2 the surface
-	 * is 640x480 under TortOS's 1024x768, and the in-game menu drew the paused
+	 * is 640x480 under ZyperOS's 1024x768, and the in-game menu drew the paused
 	 * frame in the top-left 640x480 of the screen until it was said. */
 	if (diatom_proto_connected())
 		diatom_proto_send("DISPLAY\tmode=%s\tfilter=%s\trect=%dx%d+%d+%d\tsurface=%dx%d",
@@ -1556,7 +1556,7 @@ static int run_session_inner(const diatom_session *sn)
 	}
 
 	/* THE PLAIN JOYPAD, WHICH IS NOT THE THREE-BUTTON PAD. This comment used
-	 * to say it was, and TortOS's backlog carried a whole item built on that
+	 * to say it was, and ZyperOS's backlog carried a whole item built on that
 	 * reading: Genesis six-button games were supposed to be playing with three
 	 * because of this line.
 	 *
