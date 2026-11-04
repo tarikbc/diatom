@@ -195,6 +195,7 @@ typedef struct {
 	int  major;             /* the OpenGL ES version asked for: 2 or 3 */
 	int  max_w, max_h;      /* the largest frame the core will draw */
 	bool depth, stencil;
+	bool top_down;          /* its first row at the top, not GL's way up */
 } diatom_gpu_spec;
 
 bool  diatom_port_gpu_begin(const diatom_gpu_spec *spec);
@@ -206,7 +207,8 @@ void  diatom_port_gpu_end(void);
 uintptr_t diatom_port_gpu_target(void);
 void *diatom_port_gpu_proc(const char *name);
 /* The frame just drawn: w x h at the framebuffer's bottom-left corner, GL's
- * way up (bottom row first). Shown like a present's, into `dst`. */
+ * way up (bottom row first) unless the spec said top_down. Shown like a
+ * present's, into `dst`. */
 void  diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter);
 /* The last frame presented, read back as XRGB8888, top row first, w * 4 bytes
  * a row, for the host's previews and shots. False with no GPU frame yet. */

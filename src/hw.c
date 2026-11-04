@@ -91,6 +91,9 @@ bool diatom_hw_start(diatom_core *c)
 	spec.max_h   = (int)av.geometry.max_height;
 	spec.depth   = g_hw.depth;
 	spec.stencil = g_hw.stencil;
+	/* libretro's flag, true for GL's own way up (Flycast's), false for a
+	 * core that draws its first row at the top */
+	spec.top_down = !g_hw.bottom_left_origin;
 	if (!diatom_port_gpu_begin(&spec)) {
 		fprintf(stderr, "diatom: no GPU context for the core\n");
 		return false;

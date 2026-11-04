@@ -18,7 +18,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
-#include <ucontext.h>
 #include <unistd.h>
 
 #include "cheevos.h"
@@ -217,28 +216,31 @@ static int          g_nplanes;
 /* A GPU frame (hw.c) is no pixels until asked: read back into g_frame as
  * XRGB8888, top row first, for a preview. Once per pause and once at exit,
  * like the preview itself, so the cost of the read never reaches a frame. */
-static void gpu_snapshot(void)
+static bool gpu_snapshot(void)
 {
 	size_t need = (size_t)g_frame_w * (size_t)g_frame_h * 4;
 	int w = 0, h = 0;
 
-	if (!diatom_hw_active() || need == 0) return;
+	if (need == 0) return false;
 	if (need > g_frame_cap) {
 		void *p = realloc(g_frame, need);
-		if (!p) return;
+		if (!p) return false;
 		g_frame = p;
 		g_frame_cap = need;
 	}
-	if (!diatom_port_gpu_read(g_frame, &w, &h, g_frame_cap)) return;
+	if (!diatom_port_gpu_read(g_frame, &w, &h, g_frame_cap)) return false;
 	g_frame_w = w;
 	g_frame_h = h;
 	g_frame_pitch = (size_t)w * 4;
 	g_policy.pixfmt = DIATOM_PIX_XRGB8888;
+	return true;
 }
 
 static bool write_preview(const char *path)
 {
-	gpu_snapshot();
+	/* No picture rather than the last game's pixels, which g_frame still
+	 * holds while a GPU game draws none of its own */
+	if (diatom_hw_active() && !gpu_snapshot()) return false;
 	if (g_dual && g_nplanes > 0 && g_frame) {
 		int bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4, w = 0, h = 0;
 		void *pic = scr_compose(g_frame, g_frame_pitch, bpp, g_planes, g_nplanes, &w, &h);
@@ -362,40 +364,6 @@ static const struct {
 	{ SIGABRT, "EXIT\treason=crash\tsignal=SIGABRT\n", "ERROR\tcode=crash\tmsg=SIGABRT\n" },
 };
 
-/* Deliberately no diatom_port_present_stop() below. It waits on a condition
- * variable, which is not async-signal-safe, and a crashed game that tears on
- * its way out is a far better outcome than one that deadlocks in a signal
- * handler with the display held. The tear is milliseconds; the deadlock would
- * be a power cycle. */
-static void on_crash(int sig)
-{
-	size_t i;
-
-	/* PHASE_IDLE says no game was in flight, so there is nothing to report
-	 * about one. Diatom dying between sessions reaches the launcher as the
-	 * socket closing, which the protocol already relies on for liveness. */
-	if (g_phase != PHASE_IDLE)
-		for (i = 0; i < sizeof crash_lines / sizeof crash_lines[0]; i++)
-			if (crash_lines[i].sig == sig) {
-				diatom_proto_emit_fatal(g_phase == PHASE_RUNNING
-				                        ? crash_lines[i].running
-				                        : crash_lines[i].loading);
-				break;
-			}
-
-	/* Then die of the original signal with its original disposition. Anything
-	 * else lies about how the process ended: the wait status is how a
-	 * supervisor tells a crash from a clean stop, and the core dump is how
-	 * anyone finds out why. Returning instead would re-run the faulting
-	 * instruction and loop here forever.
-	 *
-	 * signal() and raise() are both on the async-signal-safe list; sigaction()
-	 * with a memset struct is not, which is why the older-looking call is the
-	 * correct one here. */
-	signal(sig, SIG_DFL);
-	raise(sig);
-}
-
 /* Where it died, for whoever reads the log: the faulting address, the
  * instruction, and the executable mappings to place it in a library. All of
  * it with write(), open() and read(), which are async-signal-safe; formatting
@@ -425,7 +393,9 @@ static void crash_where(siginfo_t *si, void *uc)
 	int fd, i;
 
 	crash_hex("diatom: crash at ", (uintptr_t)si->si_addr);
-#if defined(__aarch64__)
+	/* glibc's signal.h gives ucontext_t, and its aarch64 registers; Darwin's
+	 * are elsewhere, behind a pointer, and the desktop port builds there */
+#if defined(__linux__) && defined(__aarch64__)
 	crash_hex("diatom: pc ", (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc);
 	crash_hex("diatom: lr ", (uintptr_t)((ucontext_t *)uc)->uc_mcontext.regs[30]);
 #else
@@ -435,6 +405,7 @@ static void crash_where(siginfo_t *si, void *uc)
 	while ((got = read(fd, chunk, sizeof chunk)) > 0)
 		for (i = 0; i < got; i++) {
 			if (len < sizeof line - 1) line[len++] = chunk[i];
+			else line[sizeof line - 2] = '\n';   /* cut short, still a line */
 			if (chunk[i] != '\n') continue;
 			/* the executable ones only: "r-xp" at the permissions */
 			if (len > 30 && memchr(line, 'x', len < 40 ? len : 40))
@@ -444,10 +415,42 @@ static void crash_where(siginfo_t *si, void *uc)
 	close(fd);
 }
 
-static void on_crash_info(int sig, siginfo_t *si, void *uc)
+/* Deliberately no diatom_port_present_stop() below. It waits on a condition
+ * variable, which is not async-signal-safe, and a crashed game that tears on
+ * its way out is a far better outcome than one that deadlocks in a signal
+ * handler with the display held. The tear is milliseconds; the deadlock would
+ * be a power cycle. */
+static void on_crash(int sig, siginfo_t *si, void *uc)
 {
+	size_t i;
+
+	/* PHASE_IDLE says no game was in flight, so there is nothing to report
+	 * about one. Diatom dying between sessions reaches the launcher as the
+	 * socket closing, which the protocol already relies on for liveness. */
+	if (g_phase != PHASE_IDLE)
+		for (i = 0; i < sizeof crash_lines / sizeof crash_lines[0]; i++)
+			if (crash_lines[i].sig == sig) {
+				diatom_proto_emit_fatal(g_phase == PHASE_RUNNING
+				                        ? crash_lines[i].running
+				                        : crash_lines[i].loading);
+				break;
+			}
+
+	/* Then where, for the log: after the launcher has heard, since a stalled
+	 * stderr would block these writes. */
 	crash_where(si, uc);
-	on_crash(sig);
+
+	/* Then die of the original signal with its original disposition. Anything
+	 * else lies about how the process ended: the wait status is how a
+	 * supervisor tells a crash from a clean stop, and the core dump is how
+	 * anyone finds out why. Returning instead would re-run the faulting
+	 * instruction and loop here forever.
+	 *
+	 * signal() and raise() are both on the async-signal-safe list; sigaction()
+	 * with a memset struct is not, which is why the older-looking call is the
+	 * correct one here. */
+	signal(sig, SIG_DFL);
+	raise(sig);
 }
 
 /* A core that calls exit() on a fatal error - some do - raises no signal, so
@@ -498,7 +501,7 @@ static void install_crash_handlers(void)
 	sigaltstack(&ss, NULL);
 
 	memset(&sa, 0, sizeof sa);
-	sa.sa_sigaction = on_crash_info;
+	sa.sa_sigaction = on_crash;
 	sa.sa_flags     = SA_ONSTACK | SA_SIGINFO;
 	/* Block everything for the duration: a second fault inside the handler
 	 * then cannot re-enter it, and the kernel kills us outright instead. That
@@ -652,6 +655,10 @@ static bool g_audio_fast;
 static pthread_t g_host_thread;
 static size_t    g_foreign_high;       /* three quarters of the device's queue; 0 none */
 static volatile bool g_foreign_held = true;   /* false while the core ends its threads */
+/* DIATOM_AUDIO_DEBUG, read on the host's thread as a session configures its
+ * sound: getenv on the core's thread could race a setenv here (AUDIODEV, on
+ * SETAUDIO). */
+static bool      g_foreign_debug;
 
 /* The core's clear-waits callback (env.c): false lets go of a thread held for
  * the speaker, while the core winds its threads down at unload. */
@@ -676,7 +683,7 @@ void diatom_on_audio_batch_store(const int16_t *data, size_t frames)
 {
 	if (!pthread_equal(pthread_self(), g_host_thread)) {
 		foreign_pace();
-		if (getenv("DIATOM_AUDIO_DEBUG")) {
+		if (g_foreign_debug) {
 			static uint64_t since, got;
 			uint64_t now = diatom_port_now_us();
 
@@ -1797,6 +1804,7 @@ static int run_session_inner(const diatom_session *sn)
 		diatom_audio_configure(audio_rate, g_caps.audio_rate, cap);
 		g_foreign_high = (size_t)cap * 3 / 4;
 		g_foreign_held = true;
+		g_foreign_debug = getenv("DIATOM_AUDIO_DEBUG") != NULL;
 	}
 	diatom_audio_prime();
 

@@ -115,6 +115,7 @@ typedef struct {
 	 * frame at its bottom-left, and the fence that says the drawing is done.
 	 * The thread waits on the fence before it samples. */
 	bool          gpu;
+	bool          top_down;     /* a GPU frame drawn first row at the top */
 	GLuint        gpu_tex;
 	int           tex_w, tex_h;
 	EGLSyncKHR    fence;
@@ -175,6 +176,7 @@ static GLuint     g_gpu_read_fb;                 /* gpu_read's, for any slot */
 static int        g_gpu_attached = -1;           /* the slot whose texture g_gpu_fb holds */
 static EGLSyncKHR g_gpu_done[MAILBOX_FRAMES];    /* under g_mx */
 static int        g_gpu_w, g_gpu_h;
+static bool       g_gpu_top_down;                /* the core draws its first row at the top */
 static int        g_gpu_drawing = -1;            /* the slot the core draws into; under g_mx */
 static int        g_gpu_last = -1;               /* the slot of the last GPU frame presented */
 /* The end of the core's last frame on the GPU, for present_gpu's throttle */
@@ -366,6 +368,11 @@ static const struct { int code; int btn; } keymap[] = {
 
 static SDL_AudioDeviceID g_audio;
 static char              g_audio_dev[128];
+/* The device is opened from the host's thread (SETAUDIO, a session's start)
+ * and, since a core may make its sound on a thread of its own, written from
+ * that thread too, where a write that finds the sink gone reopens the
+ * default. So g_audio and g_audio_dev change under this, one at a time. */
+static pthread_mutex_t   g_audio_dev_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static void port_logf(diatom_log_level lvl, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -823,9 +830,10 @@ static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
 	GLint  filter = f->filter == DIATOM_FILTER_SHARP ? GL_LINEAR : GL_NEAREST;
 	/* A GPU frame is GL's way up, its first row at the bottom of a texture
 	 * larger than it: sampled from row h down to row 0, so the same quads
-	 * draw it upright. */
-	float  top  = f->gpu ? (float)f->h : 0.0f;
-	float  down = f->gpu ? -1.0f : 1.0f;
+	 * draw it upright. Unless its core draws the first row at the top. */
+	bool   flip = f->gpu && !f->top_down;
+	float  top  = flip ? (float)f->h : 0.0f;
+	float  down = flip ? -1.0f : 1.0f;
 
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
@@ -1455,6 +1463,7 @@ bool diatom_port_gpu_begin(const diatom_gpu_spec *spec)
 	}
 
 	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+	g_gpu_top_down = spec->top_down;
 	g_gpu_w = spec->max_w > 0 ? spec->max_w : g_surface_w;
 	g_gpu_h = spec->max_h > 0 ? spec->max_h : g_surface_h;
 	if (max_tex > 0 && g_gpu_w > max_tex) g_gpu_w = max_tex;
@@ -1573,7 +1582,7 @@ uintptr_t diatom_port_gpu_target(void)
 		 * drawing cannot hold the core for good. */
 		struct timespec until;
 
-		clock_gettime(CLOCK_REALTIME, &until);
+		clock_gettime(CLOCK_MONOTONIC, &until);   /* g_idle's clock, set at init */
 		until.tv_nsec += 200 * 1000000L;
 		if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
 		while (g_thread_running && g_gpu_blitted != g_gpu_seq)
@@ -1672,6 +1681,7 @@ void diatom_port_present_gpu(int w, int h, diatom_rect dst, diatom_filter filter
 	}
 	f = &g_frames[i];
 	f->gpu = true;
+	f->top_down = g_gpu_top_down;
 	f->gpu_tex = g_gpu_tex[i];
 	f->tex_w = g_gpu_w;
 	f->tex_h = g_gpu_h;
@@ -1724,9 +1734,11 @@ bool diatom_port_gpu_read(void *xrgb, int *w, int *h, size_t cap)
 	glPixelStorei(GL_PACK_ALIGNMENT, prev_align);
 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
 
-	/* Bottom row first in GL, top row first out; RGBA bytes to 0x00RRGGBB */
+	/* Bottom row first in GL (unless the core drew top down), top row first
+	 * out; RGBA bytes to 0x00RRGGBB */
 	for (y = 0; y < fh; y++) {
-		const uint8_t *s = rgba + (size_t)(fh - 1 - y) * (size_t)fw * 4;
+		int row = g_gpu_top_down ? y : fh - 1 - y;
+		const uint8_t *s = rgba + (size_t)row * (size_t)fw * 4;
 		uint32_t *d = out + (size_t)y * (size_t)fw;
 
 		for (x = 0; x < fw; x++, s += 4)
@@ -1815,13 +1827,26 @@ static bool audio_open(const char *name)
 	return true;
 }
 
+static void audio_get(char *out, size_t cap)
+{
+	if (out && cap) snprintf(out, cap, "%s", g_audio_dev);
+}
+
+static size_t audio_queued(void)
+{
+	if (!g_audio) return 0;
+	return SDL_GetQueuedAudioSize(g_audio) / AUDIO_FRAME_BYTES;
+}
+
 bool diatom_port_audio_set(const char *name, char *actual, size_t cap)
 {
 	const char *want = name ? name : "";
 	bool ok;
 
+	pthread_mutex_lock(&g_audio_dev_mx);
 	if (g_audio && !strcmp(want, g_audio_dev)) {
-		diatom_port_audio_get(actual, cap);
+		audio_get(actual, cap);
+		pthread_mutex_unlock(&g_audio_dev_mx);
 		return true;
 	}
 	ok = audio_open(name);
@@ -1832,7 +1857,8 @@ bool diatom_port_audio_set(const char *name, char *actual, size_t cap)
 	} else {
 		snprintf(g_audio_dev, sizeof g_audio_dev, "%s", name ? name : "");
 	}
-	diatom_port_audio_get(actual, cap);
+	audio_get(actual, cap);
+	pthread_mutex_unlock(&g_audio_dev_mx);
 	return ok;
 }
 
@@ -1845,25 +1871,32 @@ bool diatom_port_audio_set(const char *name, char *actual, size_t cap)
  * nothing when it fails. */
 bool diatom_port_audio_start(void)
 {
-	if (g_audio) return true;
-	if (audio_open(NULL)) {
-		g_audio_dev[0] = '\0';
-		return true;
+	bool ok = true;
+
+	pthread_mutex_lock(&g_audio_dev_mx);
+	if (!g_audio) {
+		ok = audio_open(NULL);
+		if (ok) g_audio_dev[0] = '\0';
+		else    port_logf(DIATOM_LOG_WARN,
+		                  "audio unavailable (%s); continuing without sound",
+		                  SDL_GetError());
 	}
-	port_logf(DIATOM_LOG_WARN, "audio unavailable (%s); continuing without sound",
-	          SDL_GetError());
-	return false;
+	pthread_mutex_unlock(&g_audio_dev_mx);
+	return ok;
 }
 
 void diatom_port_audio_get(char *out, size_t cap)
 {
-	if (out && cap) snprintf(out, cap, "%s", g_audio_dev);
+	pthread_mutex_lock(&g_audio_dev_mx);
+	audio_get(out, cap);
+	pthread_mutex_unlock(&g_audio_dev_mx);
 }
 
 size_t diatom_port_audio_write(const int16_t *frames, size_t n)
 {
 	size_t queued, room;
 
+	pthread_mutex_lock(&g_audio_dev_mx);
 	if (g_audio && g_audio_dev[0] &&
 	    SDL_GetAudioDeviceStatus(g_audio) == SDL_AUDIO_STOPPED) {
 		diatom_port_log(DIATOM_LOG_WARN,
@@ -1871,27 +1904,33 @@ size_t diatom_port_audio_write(const int16_t *frames, size_t n)
 		g_audio_dev[0] = '\0';
 		audio_open(NULL);
 	}
-	if (!g_audio || !frames || !n) return 0;
-	queued = diatom_port_audio_queued();
+	if (!g_audio || !frames || !n) { pthread_mutex_unlock(&g_audio_dev_mx); return 0; }
+	queued = audio_queued();
 	room   = queued >= (size_t)AUDIO_BUFFER_FRAMES
 	       ? 0 : (size_t)AUDIO_BUFFER_FRAMES - queued;
 	if (n > room) n = room;
-	if (!n) return 0;
-	if (!g_audio_dev[0]) {
-		static int16_t down[AUDIO_BUFFER_FRAMES * 2];
-		size_t i;
+	if (n) {
+		if (!g_audio_dev[0]) {
+			static int16_t down[AUDIO_BUFFER_FRAMES * 2];
+			size_t i;
 
-		for (i = 0; i < n * 2; i++) down[i] = (int16_t)(frames[i] * RK817_HEADROOM);
-		frames = down;
+			for (i = 0; i < n * 2; i++) down[i] = (int16_t)(frames[i] * RK817_HEADROOM);
+			frames = down;
+		}
+		SDL_QueueAudio(g_audio, frames, (Uint32)(n * AUDIO_FRAME_BYTES));
 	}
-	SDL_QueueAudio(g_audio, frames, (Uint32)(n * AUDIO_FRAME_BYTES));
+	pthread_mutex_unlock(&g_audio_dev_mx);
 	return n;
 }
 
 size_t diatom_port_audio_queued(void)
 {
-	if (!g_audio) return 0;
-	return SDL_GetQueuedAudioSize(g_audio) / AUDIO_FRAME_BYTES;
+	size_t n;
+
+	pthread_mutex_lock(&g_audio_dev_mx);
+	n = audio_queued();
+	pthread_mutex_unlock(&g_audio_dev_mx);
+	return n;
 }
 
 /* ---------- input ----------------------------------------------------------- */
@@ -2232,6 +2271,18 @@ bool diatom_port_init(diatom_port_caps *out)
 	g_gbm = gbm_create_device(g_drm_fd);
 	if (!g_gbm) { diatom_port_log(DIATOM_LOG_ERROR, "pixel2: no GBM device"); return false; }
 
+	/* g_idle on the monotonic clock, before the thread exists, for the one
+	 * timed wait on it (gpu_target's): the wall clock here has jumped by
+	 * decades on a dead RTC, which would turn 200 ms into forever. */
+	{
+		pthread_condattr_t ca;
+
+		pthread_condattr_init(&ca);
+		pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+		pthread_cond_destroy(&g_idle);
+		pthread_cond_init(&g_idle, &ca);
+		pthread_condattr_destroy(&ca);
+	}
 	if (pthread_create(&g_thread, NULL, present_thread, NULL) != 0) {
 		diatom_port_log(DIATOM_LOG_ERROR, "pixel2: no presenting thread");
 		return false;
@@ -2288,7 +2339,10 @@ void diatom_port_shutdown(void)
 	if (g_pad_fd >= 0)   close(g_pad_fd);
 	if (g_keys_fd >= 0)  close(g_keys_fd);
 	if (g_jack_fd >= 0)  close(g_jack_fd);
+	pthread_mutex_lock(&g_audio_dev_mx);
 	if (g_audio)         SDL_CloseAudioDevice(g_audio);
+	g_audio = 0;
+	pthread_mutex_unlock(&g_audio_dev_mx);
 	SDL_Quit();
 	/* The GBM surface and device go with the process: the buffer on glass
 	 * stays allocated until then. */

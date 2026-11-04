@@ -266,6 +266,7 @@ static void perf_log(void) {}
 static bool env_cb(unsigned cmd, void *data)
 {
 	if (cmd == RA_GET_CLEAR_ALL_THREAD_WAITS_CB) {
+		if (!data) return false;
 		*(retro_environment_t *)data = clear_thread_waits;
 		return true;
 	}
@@ -285,9 +286,11 @@ static bool env_cb(unsigned cmd, void *data)
 	}
 	case MASK(RETRO_ENVIRONMENT_SET_HW_RENDER):
 		/* A core that draws with the GPU. See hw.c. */
-		return diatom_hw_request(data, g_caps);
+		return data && diatom_hw_request(data, g_caps);
 	case MASK(RETRO_ENVIRONMENT_GET_PERF_INTERFACE): {
 		struct retro_perf_callback *p = data;
+
+		if (!p) return false;
 
 		p->get_time_usec    = perf_time_usec;
 		p->get_cpu_features = perf_cpu_features;
@@ -307,7 +310,7 @@ static bool env_cb(unsigned cmd, void *data)
 	case MASK(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER):
 		/* OpenGL ES 3, which runs an ES 2 core too. Asked before the core
 		 * says which it wants; a port with no GPU frames prefers none. */
-		if (!g_caps || !g_caps->gpu) return false;
+		if (!g_caps || !g_caps->gpu || !data) return false;
 		*(unsigned *)data = RETRO_HW_CONTEXT_OPENGLES3;
 		return true;
 	case MASK(RETRO_ENVIRONMENT_SET_GEOMETRY):
