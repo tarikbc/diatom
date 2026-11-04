@@ -1,3 +1,8 @@
+> **Diatom has moved.** It now lives inside ZyperOS's repository, in the
+> [`diatom/` folder](https://github.com/tarikbc/ZyperOS/tree/ports/diatom), with
+> its full history and the same license (MPL-2.0). This repository is archived
+> and no longer updated; its last state is the `ports` branch (f6e41e1).
+
 <p align="center">
   <img src="docs/diatom-card.png" alt="diatom: a minimal libretro frontend" width="100%">
 </p>
