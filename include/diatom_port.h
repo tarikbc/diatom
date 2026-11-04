@@ -351,6 +351,18 @@ void diatom_port_low_battery(bool on, bool blink);
  * set implements this as a no-op and is correct. */
 void diatom_port_fast_clock(bool on);
 
+/* How much clock a game gets. FULL is the device's top clocks; MEDIUM and
+ * LIGHT are lower ceilings for systems that keep their speed under them
+ * (RUN power=, from the launcher's systems.cfg). Ceilings, not settings:
+ * under each, the governors still clock down when there is little to do,
+ * and a lower clock also means a lower voltage, which is the battery saved.
+ * The host steps a game back up at the first frame it could not keep, says
+ * FULL while a game runs fast or sits in the menu, at the end of a session
+ * and once at start, and may say the same level again; the port acts on a
+ * change. A port with no clocks of its own implements this as a no-op. */
+enum { DIATOM_POWER_FULL, DIATOM_POWER_MEDIUM, DIATOM_POWER_LIGHT };
+void diatom_port_power(int level);
+
 /* Forget everything the port remembers about the output state.
  *
  * Needed because Diatom is RESIDENT: the port keeps what it last wrote, to

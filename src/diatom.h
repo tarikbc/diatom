@@ -232,6 +232,9 @@ typedef struct {
 	 * frame that is running late, at 1x as well as fast. Empty: only fast
 	 * forward skips, as before. */
 	char frameskip[16];
+	/* RUN: "medium" or "light" caps the clocks for a system that keeps its
+	 * speed under them; empty or anything else is full. See diatom_port_power. */
+	char power[16];
 	char layout[16];       /* SETSCREENS: a name from scr_layout_names */
 	char swap[4];          /* SETSCREENS: "1" | "0"; empty leaves it */
 	int  console;          /* RUN / SETCHEEVOS */

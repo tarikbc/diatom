@@ -54,6 +54,9 @@ typedef struct diatom_session {
 	 * its drawing left out, when the core can do that. See the frame loop. */
 	bool          late_skip;
 	bool          stylus;     /* --stylus: start with stylus mode on (tests) */
+	/* RUN power=: the clock ceiling the system keeps its speed under, a
+	 * DIATOM_POWER_ level. See diatom_port_power and power_trouble. */
+	int           power;
 } diatom_session;
 
 static bool state_plane_msg(const diatom_msg *m);
@@ -569,6 +572,7 @@ static void usage(void)
 		"              [--screens 2]       the frame is two screens, top over bottom (DS)\n"
 		"              [--layout stacked|focus|single] [--swap] [--stylus]\n"
 		"              [--frameskip late]  leave a late frame undrawn, at 1x too\n"
+		"              [--power light|medium]  run under that clock ceiling\n"
 		"\n--firmware names a file the content needs, e.g. syscard3.pce for a PC\n"
 		"Engine CD. Diatom does not know which content needs what and will not\n"
 		"learn - it has no core list - so whoever launches it says.\n"
@@ -1425,6 +1429,25 @@ static void present_frame(bool fresh)
 	if (cur) sty_unstamp(g_frame, g_frame_pitch, bpp);
 }
 
+/* The clock ceiling a game runs under: the system's (RUN power=), stepped
+ * toward full for the rest of the game at the first sign it is short of
+ * clock - a frame that starts a whole period late, a stall, sound dropped -
+ * since the ceiling is there to save battery, never frames. Not again before
+ * g_power_calm_us: a clock change holds the memory up for a moment, and the
+ * first seconds of a game (its warmup, a state loaded) run late anyway. */
+static int      g_power_level;
+static uint64_t g_power_calm_us;
+
+static void power_trouble(const char *why, uint64_t now)
+{
+	if (g_power_level == DIATOM_POWER_FULL || now < g_power_calm_us) return;
+	g_power_level--;
+	diatom_port_power(g_power_level);
+	g_power_calm_us = now + 1000000;
+	printf("diatom: power up to %s after %s\n",
+	       g_power_level == DIATOM_POWER_FULL ? "full" : "medium", why);
+}
+
 static int run_session_inner(const diatom_session *sn)
 {
 	struct retro_system_av_info av;
@@ -1453,6 +1476,10 @@ static int run_session_inner(const diatom_session *sn)
 	 * any audio dropped while it was - logged when it changes and at exit. */
 	long     step_frames = 0, step_periods = 0;
 	uint64_t step_t0 = 0, step_drop0 = 0;
+	/* Sound dropped at 1x so far, and whether the last turn ran fast, for
+	 * the power ceiling (power_trouble) */
+	uint64_t power_drops = 0;
+	bool     power_fast = false;
 	long     locked_at = 0;     /* frame the current rect was computed on */
 	/* The sound rate the resampler uses: the announced one, or what the core
 	 * really sends where that is known to differ (sound_rate). */
@@ -1720,6 +1747,14 @@ static int run_session_inner(const diatom_session *sn)
 	held_at_entry = prev_buttons;
 	diatom_env_suppress(held_at_entry);
 
+	/* The system's clock ceiling, before the warmup, so its frames already
+	 * run under it */
+	g_power_level = sn->power;
+	diatom_port_power(g_power_level);
+	g_power_calm_us = diatom_port_now_us() + 2000000;
+	if (g_power_level != DIATOM_POWER_FULL)
+		printf("diatom: power %s\n", g_power_level == DIATOM_POWER_LIGHT ? "light" : "medium");
+
 	/* From here the core's DEBUG/INFO goes nowhere. Load-time chatter was worth
 	 * keeping - it is where a core states its version - but per-frame chatter is
 	 * not, and under the launcher it is written to the SD card. The measurement
@@ -1760,8 +1795,19 @@ static int run_session_inner(const diatom_session *sn)
 		 * running average, so a cheaper display mode buys speed by itself. */
 		const bool fast = g_speed > 1;
 		const int periods = fast ? 2 : 1;
-		/* Fast, at the top clock; see diatom_port_fast_clock. */
+		/* Fast, at the top clock; see diatom_port_fast_clock. Every ceiling
+		 * lifted first, since a minimum held at the top cannot pass the
+		 * maximum, and put back after, with time for the clocks to settle. */
+		if (fast && !power_fast) diatom_port_power(DIATOM_POWER_FULL);
 		diatom_port_fast_clock(fast);
+		if (!fast && power_fast) {
+			diatom_port_power(g_power_level);
+			g_power_calm_us = diatom_port_now_us() + 1000000;
+		}
+		if (!fast && diatom_audio_dropped() != power_drops)
+			power_trouble("dropped sound", diatom_port_now_us());
+		power_fast = fast;
+		power_drops = diatom_audio_dropped();
 		const uint64_t batch_t0 = diatom_port_now_us();
 		const double budget = periods * frame_us - FAST_MARGIN_US -
 		                      (g_present_frames ? (double)g_present_us /
@@ -1792,6 +1838,9 @@ static int run_session_inner(const diatom_session *sn)
 			bool     shown = true;
 			uint64_t s0 = diatom_port_now_us();
 			double   cost;
+
+			if (!fast && (double)s0 > next_us + frame_us)
+				power_trouble("a late frame", s0);
 
 			if (skips && ran + 1 < periods * g_speed &&
 			    !(sn->limit > 0 && frames + 1 >= sn->limit))
@@ -2096,10 +2145,15 @@ static int run_session_inner(const diatom_session *sn)
 				uint64_t pause_t0 = diatom_port_now_us();
 				bool resumed;
 
-				/* The menu is the launcher's, at the governor's clock; a fast
-				 * game takes the top one back on its next turn. */
+				/* The menu is the launcher's, at the governor's clock and
+				 * under no ceiling; a fast game takes the top one back on
+				 * its next turn, and a game at 1x its ceiling here. */
 				diatom_port_fast_clock(false);
+				diatom_port_power(DIATOM_POWER_FULL);
 				resumed = menu_pause(sn);
+				diatom_port_power(power_fast ? DIATOM_POWER_FULL : g_power_level);
+				g_power_calm_us = diatom_port_now_us() + 1000000;
+				power_drops = diatom_audio_dropped();
 				g_paused_preview = NULL;
 
 				/* The summary line divides frames by wall clock, and an open
@@ -2193,6 +2247,7 @@ static int run_session_inner(const diatom_session *sn)
 			 * lying about its frame rate. */
 			next_us = (double)now;
 			resyncs++;
+			if (g_speed <= 1) power_trouble("a stall", now);
 		}
 		/* Otherwise keep the debt and let the next short sleep repay it. */
 	}
@@ -2205,6 +2260,7 @@ static int run_session_inner(const diatom_session *sn)
 	if (g_terminate)
 		printf("diatom: terminated by signal; saving\n");
 	diatom_port_fast_clock(false);
+	diatom_port_power(DIATOM_POWER_FULL);
 
 	/* Both paths, and in this order: the game's own save first, because losing
 	 * it is a defect, then the state, which is a convenience. */
@@ -2363,6 +2419,7 @@ int main(int argc, char **argv)
 	const char *channels = "stereo";
 	bool list_options = false, stylus = false;
 	const char *frameskip = "";
+	const char *power = "";
 	int screens = 1;
 	diatom_filter start_filter;
 	long limit = 0;
@@ -2400,6 +2457,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--screens") && i + 1 < argc)
 			screens = (int)strtol(argv[++i], NULL, 10);
 		else if (!strcmp(argv[i], "--frameskip") && i + 1 < argc) frameskip = argv[++i];
+		else if (!strcmp(argv[i], "--power") && i + 1 < argc) power = argv[++i];
 		else if (!strcmp(argv[i], "--layout") && i + 1 < argc) {
 			int l = scr_layout_index(argv[++i]);
 			if (l < 0) { usage(); return 1; }
@@ -2475,6 +2533,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	diatom_port_fast_clock(false);
+	diatom_port_power(DIATOM_POWER_FULL);
 
 	/* Once for the life of the process, not per session: the first thing a
 	 * session does is dlopen and start a core, and a core that dies there is
@@ -2561,6 +2620,9 @@ int main(int argc, char **argv)
 			sn.console    = m.console;
 			sn.screens    = m.screens;
 			sn.late_skip  = !strcmp(m.frameskip, "late");
+			sn.power      = !strcmp(m.power, "light")  ? DIATOM_POWER_LIGHT
+			              : !strcmp(m.power, "medium") ? DIATOM_POWER_MEDIUM
+			              : DIATOM_POWER_FULL;
 			sn.mode   = start_mode;
 			sn.filter = start_filter;
 			run_session(&sn);   /* its own ERROR/EXIT is the report */
@@ -2583,6 +2645,9 @@ int main(int argc, char **argv)
 			.limit = limit, .mode = start_mode, .filter = start_filter,
 			.list_only = list_options, .screens = screens,
 			.late_skip = !strcmp(frameskip, "late"), .stylus = stylus,
+			.power = !strcmp(power, "light")  ? DIATOM_POWER_LIGHT
+			       : !strcmp(power, "medium") ? DIATOM_POWER_MEDIUM
+			       : DIATOM_POWER_FULL,
 		};
 		int rc = run_session(&sn);
 		if (rc) return rc;

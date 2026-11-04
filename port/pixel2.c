@@ -1671,6 +1671,44 @@ void diatom_port_fast_clock(bool on)
 	}
 }
 
+/* The ceilings, off this board's own tables: the CPU's steps (1296 MHz at
+ * the top), the DDR's three trained rates (194, 328, 1056 MHz) and the GPU's
+ * steps (200 to 520 MHz). FULL gives each back its top: the CPU its own
+ * maximum, and 0 to a devfreq max_freq, which the kernel reads as no
+ * ceiling. The DDR runs under the performance governor (plastron's
+ * S01governor), so its ceiling is its rate. */
+static bool sysfs_put(const char *path, const char *v)
+{
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	bool ok;
+
+	if (fd < 0) return false;
+	ok = write(fd, v, strlen(v)) == (ssize_t)strlen(v);
+	close(fd);
+	return ok;
+}
+
+void diatom_port_power(int level)
+{
+	static const struct { const char *cpu, *ram, *gpu; } lv[] = {
+		[DIATOM_POWER_FULL]   = { NULL,      "0",         "0" },
+		[DIATOM_POWER_MEDIUM] = { "1008000", "0",         "300000000" },
+		[DIATOM_POWER_LIGHT]  = { "816000",  "328000000", "200000000" },
+	};
+	static int now = -1;
+	bool ok;
+
+	if (level < DIATOM_POWER_FULL || level > DIATOM_POWER_LIGHT || level == now) return;
+	now = level;
+	ok = lv[level].cpu
+	   ? sysfs_put(DIATOM_CPUFREQ "scaling_max_freq", lv[level].cpu)
+	   : diatom_cpufreq_copy(DIATOM_CPUFREQ "cpuinfo_max_freq",
+	                         DIATOM_CPUFREQ "scaling_max_freq");
+	ok &= sysfs_put("/sys/class/devfreq/dmc/max_freq", lv[level].ram);
+	ok &= sysfs_put("/sys/class/devfreq/ff400000.gpu/max_freq", lv[level].gpu);
+	if (!ok) diatom_port_log(DIATOM_LOG_WARN, "pixel2: could not set every clock ceiling");
+}
+
 /* ---------- lifecycle ------------------------------------------------------- */
 
 /* The connected connector, the CRTC driving it and its mode. The panel is the

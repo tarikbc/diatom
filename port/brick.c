@@ -1969,3 +1969,6 @@ void diatom_port_fast_clock(bool on)
 		diatom_port_log(DIATOM_LOG_WARN, "brick: could not set the CPU's lowest clock");
 	}
 }
+
+/* The Brick's clocks are not measured per system: every game gets them all */
+void diatom_port_power(int level) { (void)level; }

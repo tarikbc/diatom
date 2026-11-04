@@ -248,6 +248,8 @@ static void parse_line(char *line, diatom_msg *out)
 		else if (!strcmp(field, "screens")) out->screens = (int)strtol(v, NULL, 10);
 		else if (!strcmp(field, "frameskip"))
 			snprintf(out->frameskip, sizeof out->frameskip, "%s", v);
+		else if (!strcmp(field, "power"))
+			snprintf(out->power, sizeof out->power, "%s", v);
 		else if (!strcmp(field, "layout"))
 			snprintf(out->layout, sizeof out->layout, "%s", v);
 		else if (!strcmp(field, "swap")) snprintf(out->swap, sizeof out->swap, "%s", v);

@@ -579,3 +579,4 @@ static bool g_muted;
 void diatom_port_mute_set(bool on) { g_muted = on; }
 bool diatom_port_mute_get(void) { return g_muted; }
 void diatom_port_fast_clock(bool on) { (void)on; }
+void diatom_port_power(int level) { (void)level; }
