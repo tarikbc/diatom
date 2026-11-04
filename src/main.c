@@ -23,6 +23,7 @@
 #include "cheevos.h"
 #include "diatom.h"
 #include "levels.h"
+#include "screens.h"
 
 /* --- the frame the core last handed us ----------------------------------- */
 static void       *g_frame;
@@ -46,6 +47,13 @@ typedef struct diatom_session {
 	int           mode;
 	diatom_filter filter;
 	bool          list_only;
+	/* 2: the frame is two screens, top over bottom (RUN screens=2, a DS
+	 * game). Layouts and the stylus apply only then; see screens.h. */
+	int           screens;
+	/* RUN frameskip=late: at 1x too, a frame that starts late is run with
+	 * its drawing left out, when the core can do that. See the frame loop. */
+	bool          late_skip;
+	bool          stylus;     /* --stylus: start with stylus mode on (tests) */
 } diatom_session;
 
 static bool state_plane_msg(const diatom_msg *m);
@@ -133,15 +141,16 @@ static bool show_overlay(const char *path, unsigned ms)
  * reads, top-down rows because that is what BMP wants for a positive height...
  * negative height, rather - top-down needs biHeight < 0, and getting that
  * wrong renders every card upside down. */
-static bool write_preview(const char *path)
+static bool write_bmp(const char *path, const void *pixels, int w, int h,
+                      size_t pitch)
 {
 	FILE *f;
 	unsigned char hdr[54];
-	int w = g_frame_w, h = g_frame_h, y, x;
+	int y, x;
 	size_t row = (size_t)w * 3, pad = (4 - (row & 3)) & 3;
 	unsigned int size = 54 + (unsigned int)((row + pad) * (size_t)h);
 
-	if (!g_frame || w <= 0 || h <= 0) return false;
+	if (!pixels || w <= 0 || h <= 0) return false;
 	f = fopen(path, "wb");
 	if (!f) return false;
 
@@ -159,8 +168,8 @@ static bool write_preview(const char *path)
 
 	/* Bottom-up, as positive-height BMP requires. */
 	for (y = h - 1; y >= 0; y--) {
-		const unsigned char *src = (const unsigned char *)g_frame
-		                         + (size_t)y * g_frame_pitch;
+		const unsigned char *src = (const unsigned char *)pixels
+		                         + (size_t)y * pitch;
 		unsigned char px[3] = { 0, 0, 0 };
 
 		for (x = 0; x < w; x++) {
@@ -181,6 +190,37 @@ static bool write_preview(const char *path)
 	}
 	fclose(f);
 	return true;
+}
+
+/* Two screens laid out (screens.h): defined below, with the display mode. */
+static bool         g_dual;
+/* The pause preview's path while a game with two screens is paused, so a
+ * layout changed from the launcher's menu can be shown there at once: the
+ * preview of a layout is that layout's picture (write_preview), and the
+ * menu draws it as its backdrop. NULL while running, when nothing is drawn
+ * from it until the next pause writes it anyway. */
+static const char  *g_paused_preview;
+static diatom_plane g_planes[DIATOM_PLANES_MAX];
+static int          g_nplanes;
+
+/* What is on the panel, at the game's own scale. For a DS layout that is not
+ * the frame: a single screen is half of it, and focus puts the second screen
+ * beside the first at a quarter of the size. The launcher draws the paused
+ * frame into DISPLAY's rect, which for a layout is the planes' bounds, so the
+ * preview is that rect's picture, composed (scr_compose) - the in-game menu
+ * then sits over what the player was looking at, not over a tall strip
+ * squeezed into the wrong box. Once per pause and once at exit. */
+static bool write_preview(const char *path)
+{
+	if (g_dual && g_nplanes > 0 && g_frame) {
+		int bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4, w = 0, h = 0;
+		void *pic = scr_compose(g_frame, g_frame_pitch, bpp, g_planes, g_nplanes, &w, &h);
+		bool ok = pic && write_bmp(path, pic, w, h, (size_t)w * (size_t)bpp);
+
+		free(pic);
+		if (ok) return true;
+	}
+	return write_bmp(path, g_frame, g_frame_w, g_frame_h, g_frame_pitch);
 }
 
 static diatom_port_caps g_caps;
@@ -405,6 +445,12 @@ static double        g_base_aspect;
 static int           g_mode;
 static diatom_filter g_filter;
 
+/* The DS layout, and whether the bottom screen goes first. Held across games,
+ * as the display mode is, and set by the launcher after each RUN
+ * (SETSCREENS); MENU+L1 swaps in a game. Applies only while g_dual. */
+static scr_layout    g_layout = SCR_STACKED;
+static bool          g_swap;
+
 /* What presenting cost this session, for the summary at exit. */
 static long     g_present_frames;
 static uint64_t g_present_us;
@@ -520,6 +566,9 @@ static void usage(void)
 		"              [--cores <dir>]     map every core there before listening\n"
 		"              [--core-option key=value] ...   repeatable\n"
 		"              [--list-options]    what this core offers, then exit\n"
+		"              [--screens 2]       the frame is two screens, top over bottom (DS)\n"
+		"              [--layout stacked|focus|single] [--swap] [--stylus]\n"
+		"              [--frameskip late]  leave a late frame undrawn, at 1x too\n"
 		"\n--firmware names a file the content needs, e.g. syscard3.pce for a PC\n"
 		"Engine CD. Diatom does not know which content needs what and will not\n"
 		"learn - it has no core list - so whoever launches it says.\n"
@@ -538,13 +587,34 @@ static const char *filter_name(diatom_filter f)
 
 static void apply_display(int mode, diatom_filter filter)
 {
+	diatom_rect shown;
+	int i;
+
 	g_mode   = mode;
 	g_filter = filter;
 	g_dst = diatom_scale_rect(diatom_modes[mode].mode, g_base_w, g_base_h,
 	                          g_base_aspect, g_caps.surface_w, g_caps.surface_h);
+	shown = g_dst;
+	/* Two screens: each half where the layout puts it, and what the launcher
+	 * hears as the rect is where they are together. The stylus puts the
+	 * bottom screen first in focus and single, so the screen it touches is
+	 * the large one, or the one shown. */
+	g_nplanes = 0;
+	if (g_dual)
+		g_nplanes = scr_planes(g_layout,
+		                       g_layout == SCR_STACKED ? g_swap : (g_swap || sty_on()),
+		                       diatom_modes[mode].mode, g_base_w, g_base_h,
+		                       g_caps.surface_w, g_caps.surface_h, g_planes);
+	if (g_nplanes) shown = scr_bounds(g_planes, g_nplanes);
+	diatom_port_planes(g_planes, g_nplanes);
 	printf("diatom: display %-10s %-7s %4dx%-4d at %4d,%-4d  %s\n",
 	       diatom_modes[mode].name, filter_name(filter),
-	       g_dst.w, g_dst.h, g_dst.x, g_dst.y, diatom_modes[mode].note);
+	       shown.w, shown.h, shown.x, shown.y, diatom_modes[mode].note);
+	for (i = 0; i < g_nplanes; i++)
+		printf("diatom: screens %-7s %s screen %3dx%-3d -> %4dx%-4d at %4d,%-4d\n",
+		       scr_layout_names[g_layout], g_planes[i].src.y ? "bottom" : "top",
+		       g_planes[i].src.w, g_planes[i].src.h,
+		       g_planes[i].dst.w, g_planes[i].dst.h, g_planes[i].dst.x, g_planes[i].dst.y);
 	fflush(stdout);
 
 	/* Reported from the ONE place the mode ever changes, so a launcher hears
@@ -559,7 +629,7 @@ static void apply_display(int mode, diatom_filter filter)
 	if (diatom_proto_connected())
 		diatom_proto_send("DISPLAY\tmode=%s\tfilter=%s\trect=%dx%d+%d+%d\tsurface=%dx%d",
 		                  diatom_modes[mode].name, filter_name(filter),
-		                  g_dst.w, g_dst.h, g_dst.x, g_dst.y,
+		                  shown.w, shown.h, shown.x, shown.y,
 		                  g_caps.surface_w, g_caps.surface_h);
 }
 
@@ -721,6 +791,7 @@ static bool menu_pause(const diatom_session *sn)
 	 * player stopped on. Parking the same picture that is already showing is
 	 * invisible, which is why this handover never flashed. */
 	diatom_port_present_stop(DIATOM_PARK_KEEP);
+	g_paused_preview = sn->preview;
 
 	/* Symmetrical with RUNNING: the launcher may draw from here. */
 	diatom_proto_send("PAUSED");
@@ -1162,6 +1233,76 @@ static void display_set(const diatom_msg *m)
 	apply_display(mode, filter);
 }
 
+/* ---- two screens ---------------------------------------------------------
+ *
+ * The layout is the launcher's to choose and Diatom's to apply, as the display
+ * mode is: SETSCREENS writes it, SCREENS reads it, and both answer with the
+ * whole state, `dual=` saying whether this game is one it applies to. The
+ * stylus is the player's, toggled in the game with L2, so STYLUS is also sent
+ * unsolicited on every change; the launcher's menu reads it to say On or Off. */
+/* Paused, the launcher's menu is drawn over the preview in DISPLAY's rect:
+ * a new layout is a new picture there as well as a new rect, so it is written
+ * again and said, between the DISPLAY that apply_display sent and the
+ * SCREENS or STYLUS that closes the answer. */
+static void repreview(void)
+{
+	if (g_paused_preview && write_preview(g_paused_preview))
+		diatom_proto_send("PREVIEW\tpath=%s", g_paused_preview);
+}
+
+static void screens_emit(void)
+{
+	diatom_proto_send("SCREENS\tlayout=%s\tswap=%d\tdual=%d",
+	                  scr_layout_names[g_layout], g_swap ? 1 : 0, g_dual ? 1 : 0);
+}
+
+static void screens_set(const diatom_msg *m)
+{
+	int l = g_layout;
+
+	if (m->layout[0] && (l = scr_layout_index(m->layout)) < 0) {
+		diatom_proto_send("ERROR\tcode=bad_screens\tmsg=%s", m->layout);
+		return;
+	}
+	if (m->swap[0] && strcmp(m->swap, "0") && strcmp(m->swap, "1")) {
+		diatom_proto_send("ERROR\tcode=bad_screens\tmsg=swap=%s", m->swap);
+		return;
+	}
+	/* Both checked before either applies, as SETDISPLAY does. */
+	g_layout = (scr_layout)l;
+	if (m->swap[0]) g_swap = m->swap[0] == '1';
+	if (g_dual) {
+		apply_display(g_mode, g_filter);
+		repreview();
+	}
+	screens_emit();
+}
+
+static void stylus_emit(void)
+{
+	if (diatom_proto_connected())
+		diatom_proto_send("STYLUS\ton=%d", sty_on() ? 1 : 0);
+}
+
+/* On only for a game with two screens: anywhere else there is no bottom
+ * screen to touch, and the answer says so - on=0 - rather than agreeing to a
+ * stylus nothing will draw. Focus and single put the touched screen first,
+ * so they are laid out again. */
+static void stylus_set(bool on)
+{
+	if (!g_dual) on = false;
+	if (on != sty_on()) {
+		sty_set(on);
+		printf("diatom: stylus %s\n", on ? "on" : "off");
+		fflush(stdout);
+		if (g_dual && g_layout != SCR_STACKED) {
+			apply_display(g_mode, g_filter);
+			repreview();
+		}
+	}
+	stylus_emit();
+}
+
 /* Socket mode's premap, on its own thread. A signal may land on this thread
  * too, which the wake pipe above already allows for.
  *
@@ -1231,6 +1372,10 @@ static bool state_plane_msg(const diatom_msg *m)
 	case DIATOM_MSG_SETCHANNELS: channels_set(m);  return true;
 	case DIATOM_MSG_DISC:    disc_emit();  return true;
 	case DIATOM_MSG_SETDISC: disc_set(m);  return true;
+	case DIATOM_MSG_SCREENS:    screens_emit();      return true;
+	case DIATOM_MSG_SETSCREENS: screens_set(m);      return true;
+	case DIATOM_MSG_STYLUS:     stylus_emit();       return true;
+	case DIATOM_MSG_SETSTYLUS:  stylus_set(m->on);   return true;
 	case DIATOM_MSG_PREMAP:
 		/* The launcher has drawn: the cores and the sound device, which both
 		 * waited so as not to compete with its start. */
@@ -1262,6 +1407,24 @@ static bool state_plane_msg(const diatom_msg *m)
 	}
 }
 
+/* One present, with the stylus cursor in it while it is on. Stamped into the
+ * kept frame and taken out again straight after, because every port copies
+ * the frame inside present (diatom_port.h): the cursor reaches the panel and
+ * the frame kept for dupes and previews never holds it. With the cursor up the
+ * frame goes out even when the core sent none new, so a cursor moved over a
+ * still picture moves on the panel too. */
+static void present_frame(bool fresh)
+{
+	int  bpp = g_policy.pixfmt == DIATOM_PIX_RGB565 ? 2 : 4;
+	bool cur = g_dual && sty_on() && g_frame && g_frame_w > 0;
+
+	if (cur) sty_stamp(g_frame, g_frame_pitch, bpp, g_frame_w, g_frame_h);
+	diatom_port_present((fresh || cur) ? g_frame : NULL,
+	                    g_frame_w, g_frame_h, g_frame_pitch,
+	                    g_policy.pixfmt, g_dst, g_filter);
+	if (cur) sty_unstamp(g_frame, g_frame_pitch, bpp);
+}
+
 static int run_session_inner(const diatom_session *sn)
 {
 	struct retro_system_av_info av;
@@ -1272,6 +1435,16 @@ static int run_session_inner(const diatom_session *sn)
 	uint32_t chord_hold = 0;    /* R1, while it belongs to MENU+R1 */
 	bool     menu_armed = false, menu_chorded = false;
 	long     fast_frames = 0, fast_turns = 0, fast_unshown = 0;
+	/* frameskip=late: frames run late and left undrawn, and how many in a
+	 * row the last of them was. */
+	long     late_unshown = 0;
+	int      late_row = 0;
+	bool     last_shown = true;
+	/* What retro_run cost in all, drawn and undrawn apart, for the summary:
+	 * the paced rate says only that the loop kept up, this says by how much -
+	 * the one number that compares a container with a device. */
+	double   run_us_shown = 0.0, run_us_unshown = 0.0;
+	long     run_n_shown = 0, run_n_unshown = 0;
 	/* What a core frame costs, run to be shown and run to be skipped, kept
 	 * apart because skipping the drawing is the point (see the batch below).
 	 * For a core that doesn't skip they come out the same. */
@@ -1304,6 +1477,12 @@ static int run_session_inner(const diatom_session *sn)
 	g_frame_w = g_frame_h = 0;
 	g_frame_pitch = 0;
 	g_frame_fresh = false;
+	/* One screen until this game's geometry says it can be two. */
+	g_dual = false;
+	g_nplanes = 0;
+	diatom_port_planes(NULL, 0);
+	sty_reset(0, 0);
+	diatom_env_pointer(false, 0, 0);
 
 	g_core = diatom_core_resident(sn->core);
 	if (!g_core) {
@@ -1454,7 +1633,21 @@ static int run_session_inner(const diatom_session *sn)
 	if (diatom_env_rotation())
 		printf("diatom: turned %u quarter(s) counter-clockwise to %dx%d\n",
 		       diatom_env_rotation(), g_base_w, g_base_h);
+	/* Two screens, if the launcher said so and the frame can be cut in two.
+	 * A DS frame is 256x384 and stays that, so the base geometry is the
+	 * frame's for the whole game. */
+	if (sn->screens == 2 && g_base_h >= 2 && g_base_h % 2 == 0) {
+		g_dual = true;
+		sty_reset(g_base_w, g_base_h / 2);
+		printf("diatom: two screens of %dx%d, layout %s%s\n", g_base_w, g_base_h / 2,
+		       scr_layout_names[g_layout], g_swap ? ", bottom first" : "");
+		if (sn->stylus) sty_set(true);
+	} else if (sn->screens == 2) {
+		printf("diatom: screens=2, but %dx%d does not cut in two; one picture\n",
+		       g_base_w, g_base_h);
+	}
 	apply_display(sn->mode, sn->filter);
+	if (g_dual) { screens_emit(); stylus_emit(); }
 	locked_at = 0;
 
 	/* Pace against a monotonic clock at the core's own rate, on an ABSOLUTE
@@ -1603,7 +1796,24 @@ static int run_session_inner(const diatom_session *sn)
 			if (skips && ran + 1 < periods * g_speed &&
 			    !(sn->limit > 0 && frames + 1 >= sn->limit))
 				shown = (double)(s0 - batch_t0) + unshown_us + shown_us > budget;
+			/* frameskip=late, at 1x: a frame that starts more than half a
+			 * period behind the schedule is run with its drawing left out,
+			 * so the game keeps its speed and the panel its last picture.
+			 * Two in a row at most, so at least every third frame is drawn
+			 * however far behind the loop is - 20 pictures a second at the
+			 * worst, with the game, its sound and its timing whole. A core
+			 * that draws in its own time (a DS game's 3D on an A35) gets the
+			 * time back from the frames it does not draw; the schedule's own
+			 * debt rule below still drops a stall of four frames. The idea,
+			 * at 1x and from libretro's audio buffer status callback, is
+			 * nelynes's slotPlus, as plorpOS's Diatom has it too. */
+			else if (!fast && sn->late_skip && diatom_env_frame_skippable()) {
+				shown = !((double)s0 > next_us + frame_us * 0.5 && late_row < 2);
+				if (shown) late_row = 0;
+				else { late_row++; late_unshown++; }
+			}
 			diatom_env_frame_shown(shown);
+			last_shown = shown;
 
 			g_core->run();
 			frames++;
@@ -1620,6 +1830,8 @@ static int run_session_inner(const diatom_session *sn)
 			/* A running average, an eighth new, of each kind. The first one
 			 * measured seeds both, so the first fast turn has a figure. */
 			cost = (double)(diatom_port_now_us() - s0);
+			if (shown) { run_us_shown += cost; run_n_shown++; }
+			else       { run_us_unshown += cost; run_n_unshown++; }
 			if (shown) shown_us = shown_us > 0.0 ? shown_us + (cost - shown_us) / 8.0 : cost;
 			else       unshown_us = unshown_us + (cost - unshown_us) / 8.0;
 			if (unshown_us <= 0.0) unshown_us = shown_us;
@@ -1706,10 +1918,10 @@ static int run_session_inner(const diatom_session *sn)
 
 		{
 			uint64_t p0 = diatom_port_now_us();
-			diatom_port_present(g_frame_fresh ? g_frame : NULL,
-			                    g_frame_w, g_frame_h, g_frame_pitch,
-			                    g_policy.pixfmt, g_dst,
-			                    g_filter);
+			/* A frame run undrawn is not presented: its pixels are the last
+			 * drawn frame's, already on the panel, and presenting them again
+			 * would spend on the upload what skipping saved. */
+			present_frame(g_frame_fresh && last_shown);
 			g_present_us += diatom_port_now_us() - p0;
 			g_present_frames++;
 		}
@@ -1782,12 +1994,51 @@ static int run_session_inner(const diatom_session *sn)
 		/* R1 belongs to MENU+R1 from the moment MENU is down - not from when
 		 * R1 is, so the frame R1 goes down cannot leak into the game - and
 		 * stays hidden after MENU is let go, until R1 is too. */
-		if (buttons & DIATOM_BIT(DIATOM_BTN_MENU)) chord_hold = DIATOM_BIT(DIATOM_BTN_R1);
-		else                                       chord_hold &= buttons;
+		if (buttons & DIATOM_BIT(DIATOM_BTN_MENU))
+			chord_hold = DIATOM_BIT(DIATOM_BTN_R1) |
+			             (g_dual ? DIATOM_BIT(DIATOM_BTN_L1) : 0);
+		else
+			chord_hold &= buttons;
 
-		/* The single writer. Every reason to hide a button from the core is
-		 * composed here, so no reason can clear another. */
-		diatom_env_suppress(held_at_entry | chord_hold);
+		/* The stylus, for a game with two screens. L2 turns stylus mode on
+		 * and off; while on, the d-pad moves the cursor and R2 is the stylus
+		 * on the screen. L2 and R2 are the stylus's whenever there are two
+		 * screens - a DS has neither button, so no game loses one - and the
+		 * d-pad is the cursor's only while the mode is on. The pointer goes
+		 * to the core on its next frame. */
+		{
+			uint32_t sty_mask = 0;
+
+			if (g_dual) {
+				uint32_t down = buttons & ~prev_buttons;
+
+				sty_mask = DIATOM_BIT(DIATOM_BTN_L2) | DIATOM_BIT(DIATOM_BTN_R2);
+				if ((down & DIATOM_BIT(DIATOM_BTN_L2)) &&
+				    !(buttons & DIATOM_BIT(DIATOM_BTN_MENU)))
+					stylus_set(!sty_on());
+				if (sty_on()) {
+					unsigned dirs =
+					    (buttons & DIATOM_BIT(DIATOM_BTN_UP)    ? STY_UP    : 0) |
+					    (buttons & DIATOM_BIT(DIATOM_BTN_DOWN)  ? STY_DOWN  : 0) |
+					    (buttons & DIATOM_BIT(DIATOM_BTN_LEFT)  ? STY_LEFT  : 0) |
+					    (buttons & DIATOM_BIT(DIATOM_BTN_RIGHT) ? STY_RIGHT : 0);
+
+					sty_frame(dirs, (buttons & DIATOM_BIT(DIATOM_BTN_R2)) != 0);
+					sty_mask |= DIATOM_BIT(DIATOM_BTN_UP) | DIATOM_BIT(DIATOM_BTN_DOWN) |
+					            DIATOM_BIT(DIATOM_BTN_LEFT) | DIATOM_BIT(DIATOM_BTN_RIGHT);
+				}
+				{
+					int16_t px, py;
+					bool pd = sty_pointer(&px, &py);
+
+					diatom_env_pointer(pd, px, py);
+				}
+			}
+
+			/* The single writer. Every reason to hide a button from the core
+			 * is composed here, so no reason can clear another. */
+			diatom_env_suppress(held_at_entry | chord_hold | sty_mask);
+		}
 
 		/* MENU+R1 steps the speed. MENU is a modifier, so it is armed by its
 		 * press and acts on its RELEASE. */
@@ -1819,6 +2070,15 @@ static int run_session_inner(const diatom_session *sn)
 				step_t0 = diatom_port_now_us();
 				step_drop0 = diatom_audio_dropped();
 			}
+			/* MENU+L1 swaps the two screens, a DS game's: which one is on
+			 * top, large, or shown, without opening the menu. */
+			if (g_dual && (buttons & DIATOM_BIT(DIATOM_BTN_MENU)) &&
+			    (pressed & DIATOM_BIT(DIATOM_BTN_L1))) {
+				g_swap = !g_swap;
+				menu_chorded = true;
+				apply_display(g_mode, g_filter);
+				screens_emit();
+			}
 		}
 
 		/* MENU is Diatom's own key and the ports no longer act on it, because
@@ -1840,6 +2100,7 @@ static int run_session_inner(const diatom_session *sn)
 				 * game takes the top one back on its next turn. */
 				diatom_port_fast_clock(false);
 				resumed = menu_pause(sn);
+				g_paused_preview = NULL;
 
 				/* The summary line divides frames by wall clock, and an open
 				 * menu produces no frames, so without this a long menu reads
@@ -1983,6 +2244,18 @@ static int run_session_inner(const diatom_session *sn)
 			       "excluded from the rate above\n",
 			       fast_frames, fast_secs,
 			       fast_secs > 0 ? fast_frames / fast_secs / av.timing.fps : 0.0);
+		if (run_n_shown)
+			printf("diatom: the core took %.2f ms a drawn frame on average "
+			       "(%.0f fps if unpaced)\n",
+			       run_us_shown / run_n_shown / 1000.0,
+			       1000000.0 / (run_us_shown / run_n_shown));
+		if (run_n_unshown)
+			printf("diatom: and %.2f ms a frame run undrawn, over %ld\n",
+			       run_us_unshown / run_n_unshown / 1000.0, run_n_unshown);
+		if (late_unshown)
+			printf("diatom: %ld frame(s) ran late at 1x and were left undrawn "
+			       "(frameskip=late), %.1f%% of them\n", late_unshown,
+			       paced ? late_unshown * 100.0 / paced : 0.0);
 		if (fast_unshown)
 			printf("diatom: %ld of them run unshown, the core told to skip drawing them; "
 			       "a frame %.1f ms shown, %.1f ms unshown\n",
@@ -2040,6 +2313,13 @@ static int run_session_inner(const diatom_session *sn)
 	 * launcher fades up from black, so black is the state it is about to
 	 * assume anyway. */
 	diatom_port_present_stop(DIATOM_PARK_BLANK);
+	/* The next game is one screen until it says otherwise; the planes go
+	 * now, so nothing presented between games is cut in two. */
+	g_dual = false;
+	g_nplanes = 0;
+	diatom_port_planes(NULL, 0);
+	sty_reset(0, 0);
+	diatom_env_pointer(false, 0, 0);
 
 	/* The game ran and stopped, which is EXIT rather than ERROR whatever the
 	 * reason. The launcher may take the display back now.
@@ -2081,7 +2361,9 @@ int main(int argc, char **argv)
 	const char *sock = getenv("DIATOM_SOCKET");
 	const char *cores_dir = NULL;
 	const char *channels = "stereo";
-	bool list_options = false;
+	bool list_options = false, stylus = false;
+	const char *frameskip = "";
+	int screens = 1;
 	diatom_filter start_filter;
 	long limit = 0;
 	int i, start_mode = -1, console = 0;
@@ -2113,6 +2395,18 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--socket") && i + 1 < argc) sock = argv[++i];
 		else if (!strcmp(argv[i], "--cores") && i + 1 < argc) cores_dir = argv[++i];
 		else if (!strcmp(argv[i], "--list-options")) list_options = true;
+		/* RUN's screens=, frameskip= and SETSCREENS, for a DS game run
+		 * standalone: the desktop and the container tests have no launcher. */
+		else if (!strcmp(argv[i], "--screens") && i + 1 < argc)
+			screens = (int)strtol(argv[++i], NULL, 10);
+		else if (!strcmp(argv[i], "--frameskip") && i + 1 < argc) frameskip = argv[++i];
+		else if (!strcmp(argv[i], "--layout") && i + 1 < argc) {
+			int l = scr_layout_index(argv[++i]);
+			if (l < 0) { usage(); return 1; }
+			g_layout = (scr_layout)l;
+		}
+		else if (!strcmp(argv[i], "--swap")) g_swap = true;
+		else if (!strcmp(argv[i], "--stylus")) stylus = true;
 		else if (!strcmp(argv[i], "--core-option") && i + 1 < argc) {
 			/* Recorded now, applied when the core declares its options - the
 			 * command line is parsed long before retro_set_environment runs. */
@@ -2265,6 +2559,8 @@ int main(int argc, char **argv)
 			sn.preview    = m.preview[0]    ? m.preview    : NULL;
 			sn.cheevos    = m.cheevos[0]    ? m.cheevos    : NULL;
 			sn.console    = m.console;
+			sn.screens    = m.screens;
+			sn.late_skip  = !strcmp(m.frameskip, "late");
 			sn.mode   = start_mode;
 			sn.filter = start_filter;
 			run_session(&sn);   /* its own ERROR/EXIT is the report */
@@ -2285,7 +2581,8 @@ int main(int argc, char **argv)
 			.preview = preview_path, .firmware = firmware,
 			.cheevos = cheevos_path, .console = console,
 			.limit = limit, .mode = start_mode, .filter = start_filter,
-			.list_only = list_options,
+			.list_only = list_options, .screens = screens,
+			.late_skip = !strcmp(frameskip, "late"), .stylus = stylus,
 		};
 		int rc = run_session(&sn);
 		if (rc) return rc;

@@ -26,7 +26,7 @@ LDFLAGS += -lz
 # Objects live under build/$(PORT)/ so host and cross builds cannot collide:
 # a leftover x86 main.o in a device link fails late and confusingly.
 BUILD := build/$(PORT)
-SRC   := src/main.c src/cheevos.c src/core.c src/env.c src/scale.c src/audio.c src/save.c src/proto.c src/options.c src/zip.c src/levels.c port/$(PORT).c
+SRC   := src/main.c src/cheevos.c src/core.c src/env.c src/scale.c src/audio.c src/save.c src/proto.c src/options.c src/zip.c src/levels.c src/screens.c port/$(PORT).c
 OBJ   := $(SRC:%.c=$(BUILD)/%.o)
 BIN   := $(BUILD)/diatom
 CONFORM := $(BUILD)/diatom-conform
@@ -99,7 +99,7 @@ ifeq ($(PORT),pixel2)
 endif
 
 .PHONY: all clean check check-seam check-proto check-port \
-        check-corefacts check-cheevos stub run-stub
+        check-corefacts check-cheevos check-screens stub run-stub
 
 all: $(BIN)
 
@@ -131,7 +131,7 @@ $(BUILD)/%.o: %.c
 # backend exists. Cheap to check, so check it.
 # Mechanical checks, each guarding a rule that decays the moment nothing fails
 # when it is broken: check-seam has held since day one for exactly that reason.
-check: check-seam check-corefacts check-rates check-cheevos check-proto check-port check-stateplane
+check: check-seam check-corefacts check-rates check-cheevos check-screens check-proto check-port check-stateplane
 
 # Does a RetroAchievements address reach the byte it names? Offline, needs no
 # core and no ROM, and links only cheevos.c plus the vendored runtime - so it
@@ -148,6 +148,21 @@ $(CHEEVOS_TEST): test/cheevos_test.c src/cheevos.c $(RC_OBJ)
 	$(CC) -std=gnu11 -Wall -Wextra -Wno-unused-parameter -O2 \
 	      -Iinclude -Isrc -I$(RC_DIR)/include -DRC_DISABLE_LUA \
 	      -o $@ test/cheevos_test.c src/cheevos.c $(RC_OBJ)
+
+# Two screens in one frame (src/screens.h): the DS layouts' rects on the GKD
+# Pixel 2's 640x480, the preview they compose, and the stylus - every one of
+# the bottom screen's 256x192 pixels read back through dsperate-lr's own
+# arithmetic, and the cursor drawn in and taken out without a trace. Offline,
+# like check-cheevos: src/screens.c and src/scale.c, no core, no display.
+SCREENS_TEST := $(BUILD)/screens-test
+
+check-screens: $(SCREENS_TEST)
+	@./$(SCREENS_TEST)
+
+$(SCREENS_TEST): test/screens_test.c src/screens.c src/scale.c src/screens.h src/diatom.h
+	@mkdir -p $(BUILD)
+	$(CC) -std=gnu11 -Wall -Wextra -Wno-unused-parameter -O2 \
+	      -Iinclude -Isrc -o $@ test/screens_test.c src/screens.c src/scale.c
 
 # Deliberately NOT part of `check`. It needs a build and it runs in real time -
 # Diatom paces to the core's frame rate, so 300 frames costs five seconds of

@@ -1447,6 +1447,17 @@ static void clear_pages(void)
 	for (i = 0; i < n; i++) p[i] = g_opaque;
 }
 
+static diatom_plane g_planes[DIATOM_PLANES_MAX];
+static int          g_nplanes;
+
+void diatom_port_planes(const diatom_plane *planes, int n)
+{
+	if (!planes || n < 0) n = 0;
+	if (n > DIATOM_PLANES_MAX) n = DIATOM_PLANES_MAX;
+	if (n) memcpy(g_planes, planes, sizeof *planes * (size_t)n);
+	g_nplanes = n;
+}
+
 void diatom_port_present(const void *src, int w, int h, size_t pitch,
                          diatom_pixfmt fmt, diatom_rect dst,
                          diatom_filter filter)
@@ -1454,6 +1465,24 @@ void diatom_port_present(const void *src, int w, int h, size_t pitch,
 	uint64_t t0 = 0, t1 = 0;
 	bool rect_changed;
 	int page;
+
+	/* Planes (a DS frame's two screens): this port's blit is one source rect
+	 * into one destination through prebuilt maps, so it draws the largest
+	 * plane and nothing else - one screen, never two garbled into one. The
+	 * Brick has no DS on TortOS; this only keeps the seam honest. */
+	if (src && g_nplanes > 0) {
+		const diatom_plane *p = &g_planes[0];
+		size_t bpp = fmt == DIATOM_PIX_RGB565 ? 2 : 4;
+		int i;
+
+		for (i = 1; i < g_nplanes; i++)
+			if ((long)g_planes[i].dst.w * g_planes[i].dst.h > (long)p->dst.w * p->dst.h)
+				p = &g_planes[i];
+		src = (const unsigned char *)src + (size_t)p->src.y * pitch + (size_t)p->src.x * bpp;
+		w = p->src.w;
+		h = p->src.h;
+		dst = p->dst;
+	}
 
 	/* Dupe frame: the front page already shows it. Nothing to draw, nothing
 	 * to flip. */

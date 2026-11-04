@@ -66,7 +66,7 @@ def check_that(name, cond, got):
     if not cond: fails.append(name)
 
 print("READY:", (r := drain(2.0)))
-check("proto version", [x for x in r if x.startswith("READY")][0].split("\t")[1], "proto=11")
+check("proto version", [x for x in r if x.startswith("READY")][0].split("\t")[1], "proto=12")
 
 # Before any RUN: identity must already be identity, not "everything unbound".
 send("MAP"); check("map is identity while idle", drain(), ["MAP\tmap=identity"])
@@ -207,6 +207,84 @@ check_that("resume path accepted, game reaches RUNNING",
 # pause writes the preview BEFORE announcing PAUSED - the order is the contract
 before = pathlib.Path(pv).stat().st_mtime_ns
 send("STOP"); drain(2.0)
+
+# --- Two screens in one frame ----------------------------------------------
+# A DS game's frame, top screen over bottom. The geometry is check-screens';
+# this is the wiring: that RUN screens=2 is read, that the layout reaches the
+# rect the launcher draws its menu into, that the stylus answers and refuses
+# where there is nothing to touch, and that the pause preview is the layout's
+# picture rather than the raw frame. The stub's frame is 224 lines, two
+# screens of 112, and 256 or 512 wide - it is resident and goes on toggling
+# its hires mode from game to game - so the width is read first, at native,
+# and the rects follow from it. The desktop surface is 960x720.
+import struct
+def bmp_size(path):
+    with open(path, "rb") as f: h = f.read(26)
+    return struct.unpack("<ii", h[18:26])
+
+send("SCREENS")
+check("idle: stacked, and not two screens", drain(), ["SCREENS\tlayout=stacked\tswap=0\tdual=0"])
+send("SETSTYLUS\ton=1")
+check("no stylus with nothing to touch", drain(), ["STYLUS\ton=0"])
+send("SETSCREENS\tlayout=sideways")
+check("an unknown layout is refused", drain(), ["ERROR\tcode=bad_screens\tmsg=sideways"])
+send("SETSCREENS\tlayout=focus\tswap=2")
+check("so is a swap that is not 0 or 1, and nothing changes", drain(),
+      ["ERROR\tcode=bad_screens\tmsg=swap=2"])
+
+send(f"RUN\tcore={ROOT}/build/desktop/stubcore.so\tscreens=2\tpreview={pv}")
+got = drain(3.0)
+check_that("RUN screens=2 reports two screens and the stylus off",
+           "SCREENS\tlayout=stacked\tswap=0\tdual=1" in got and "STYLUS\ton=0" in got, got)
+send("SETDISPLAY\tmode=native"); got = drain()
+W = int([l for l in got if l.startswith("DISPLAY")][0].split("rect=")[1].split("x")[0])
+check_that("stacked at native is the frame itself, 224 lines",
+           any(f"rect={W}x224+" in l for l in got), got)
+send("SETDISPLAY\tmode=aspect"); drain()
+send("SETSCREENS\tlayout=single"); got = drain()
+h = round(960 * 112 / W)
+check_that(f"single: one {W}x112 screen fitted, 960x{h} centred",
+           any(f"rect=960x{h}+0+{(720 - h) // 2}" in l for l in got if l.startswith("DISPLAY")) and
+           "SCREENS\tlayout=single\tswap=0\tdual=1" in got, got)
+send("SETSCREENS\tlayout=focus"); got = drain()
+b = min(960 / (W * 1.25), 720 / 112)
+fh = int(112 * b + 0.5)
+check_that(f"focus: {b:g}x and a quarter, 960x{fh} together",
+           any(f"rect=960x{fh}+0+{(720 - fh) // 2}" in l for l in got if l.startswith("DISPLAY")), got)
+send("SETSTYLUS\ton=1"); got = drain()
+check_that("the stylus turns on", "STYLUS\ton=1" in got, got)
+send("STYLUS"); check("and says so when asked", drain(), ["STYLUS\ton=1"])
+send("SETSCREENS\tswap=1"); got = drain()
+check_that("swap alone keeps the layout", "SCREENS\tlayout=focus\tswap=1\tdual=1" in got, got)
+send("PAUSE"); got = drain(2.0)
+check_that("pause still writes its preview first", "PAUSED" in got and
+           any(l.startswith("PREVIEW") for l in got), got)
+check("the preview is the layout's picture, 1.25 screens wide, not the frame",
+      bmp_size(pv), (W * 5 // 4, 112))
+# A layout changed from the open menu is shown there at once: the new rect,
+# then the new picture behind it, then the layout - in that order, so a
+# launcher reading up to SCREENS has both.
+send("SETSCREENS\tlayout=single"); got = drain()
+check_that("paused, a new layout re-writes the preview between DISPLAY and SCREENS",
+           [l.split("\t")[0] for l in got] == ["DISPLAY", "PREVIEW", "SCREENS"], got)
+check("and the preview is now the one screen shown", bmp_size(pv), (W, 112))
+send("SETSCREENS\tlayout=focus"); drain()
+send("RESUME"); drain(1.0)
+send("SETSCREENS\tlayout=stacked"); got = drain()
+check_that("running, it does not: nothing is drawn from it until the next pause",
+           not any(l.startswith("PREVIEW") for l in got), got)
+send("SETSCREENS\tlayout=focus"); drain()
+send("STOP"); drain(3.0)
+
+send(f"RUN\tcore={ROOT}/build/desktop/stubcore.so")
+drain(3.0)
+send("SCREENS")
+check("the next game is one screen, the layout held for the next DS game", drain(),
+      ["SCREENS\tlayout=focus\tswap=1\tdual=0"])
+send("SETSTYLUS\ton=1")
+check("and the stylus went with the game", drain(), ["STYLUS\ton=0"])
+send("STOP"); drain(3.0)
+send("SETSCREENS\tlayout=stacked\tswap=0"); drain()
 
 # --- Achievements over the protocol ----------------------------------------
 # The unit test (make check-cheevos) proves the mapping and the evaluation.
@@ -437,5 +515,22 @@ near = range(max(1, c0 - 50 * ms), min(len(R), c1 + 50 * ms))
 rstep = max(abs(R[k] - R[k - 1]) for k in near)
 check_that("no step in the right channel going or coming back - it ramps",
            rstep <= 400, f"largest sample-to-sample move {rstep}")
+# Battery RAM that appears after load, as a DS game's save chip does when
+# DSperate's save list does not name the game: adopted and written, not lost.
+# Standalone, because nothing about it is the protocol's.
+late = tempfile.mkdtemp(prefix="diatom-late-")
+rom = f"{late}/Late Game.bin"
+open(rom, "wb").write(b"\0" * 16)
+envl = dict(os.environ, STUBCORE_LATE_SRAM="30")
+out = subprocess.run([f"{ROOT}/build/desktop/diatom", "--core", f"{ROOT}/build/desktop/stubcore.so",
+                      "--rom", rom, "--save", late, "--frames", "200"],
+                     capture_output=True, text=True, env=envl, timeout=60)
+srm = f"{late}/Late Game.srm"
+data = open(srm, "rb").read() if os.path.exists(srm) else b""
+check("battery that appears at frame 30 is written as the game's .srm",
+      data, bytes(0x5a ^ (i & 0xff) for i in range(512)))
+check_that("and the log says so", "made 512 bytes of battery" in out.stderr,
+           [l for l in out.stderr.splitlines() if "save:" in l])
+
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)

@@ -196,6 +196,10 @@ static void parse_line(char *line, diatom_msg *out)
 	else if (!strcmp(field, "SETLOWBATTERY")) out->kind = DIATOM_MSG_SETLOWBATTERY;
 	else if (!strcmp(field, "DISC"))       out->kind = DIATOM_MSG_DISC;
 	else if (!strcmp(field, "SETDISC"))    out->kind = DIATOM_MSG_SETDISC;
+	else if (!strcmp(field, "SCREENS"))    out->kind = DIATOM_MSG_SCREENS;
+	else if (!strcmp(field, "SETSCREENS")) out->kind = DIATOM_MSG_SETSCREENS;
+	else if (!strcmp(field, "STYLUS"))     out->kind = DIATOM_MSG_STYLUS;
+	else if (!strcmp(field, "SETSTYLUS"))  out->kind = DIATOM_MSG_SETSTYLUS;
 	else {
 		log_(DIATOM_LOG_WARN, "proto: ignoring unknown verb '%s'", field);
 		out->kind = DIATOM_MSG_NONE;
@@ -241,6 +245,12 @@ static void parse_line(char *line, diatom_msg *out)
 		else if (!strcmp(field, "cheevos"))
 			snprintf(out->cheevos, sizeof out->cheevos, "%s", v);
 		else if (!strcmp(field, "console")) out->console = (int)strtol(v, NULL, 10);
+		else if (!strcmp(field, "screens")) out->screens = (int)strtol(v, NULL, 10);
+		else if (!strcmp(field, "frameskip"))
+			snprintf(out->frameskip, sizeof out->frameskip, "%s", v);
+		else if (!strcmp(field, "layout"))
+			snprintf(out->layout, sizeof out->layout, "%s", v);
+		else if (!strcmp(field, "swap")) snprintf(out->swap, sizeof out->swap, "%s", v);
 		else if (!strcmp(field, "key"))  snprintf(out->key,   sizeof out->key,   "%s", v);
 		else if (!strcmp(field, "value"))snprintf(out->value, sizeof out->value, "%s", v);
 		else if (!strcmp(field, "map"))  snprintf(out->map,   sizeof out->map,   "%s", v);
@@ -377,7 +387,12 @@ diatom_msg_kind diatom_proto_poll(diatom_msg *out, int timeout_ms, bool running)
 		 * SETDISC, and a launcher that sees proto=10 knows not to offer a
 		 * "Next disc" row that would do nothing - which a player stuck at
 		 * "insert disc 2" could not tell from a disc that would not read. */
-		diatom_proto_send("READY\tproto=11\tstate=%s", running ? "running" : "idle");
+		/* proto=12 adds two screens in one frame: RUN screens=2 and
+		 * frameskip=late, SCREENS and SETSCREENS, STYLUS and SETSTYLUS.
+		 * Additive: an old Diatom ignores all of it and shows a DS frame as
+		 * one tall picture with no stylus, and a launcher that sees proto=11
+		 * knows not to offer a Screens or Stylus row that would do nothing. */
+		diatom_proto_send("READY\tproto=12\tstate=%s", running ? "running" : "idle");
 		/* A displaced launcher is a vanished one, and every loop already
 		 * knows what that means - the in-game menu resumes the game. Said
 		 * after READY, so the new launcher hears where things stand first. */

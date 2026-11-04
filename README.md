@@ -23,6 +23,15 @@ Pocket systems, is pinned by TortOS and not yet measured here.
 
     diatom --core snes9x2010_libretro.so --rom parodius.sfc
 
+A Nintendo DS core's frame is two screens, top over bottom. Told so
+(`--screens 2`, or `screens=2` on the launcher's RUN), diatom cuts it in two
+and lays the screens out - stacked, one large with the other small beside it,
+or one at a time - and gives a pad with no touch panel a stylus: L2 turns it
+on, the d-pad moves a cursor over the bottom screen, R2 touches. Run with
+DSperate in an arm64 container, not yet on a device (`src/screens.h`).
+
+    diatom --core dsperate_libretro.so --rom mkds.nds --screens 2 --layout focus
+
 Standalone is the primary mode. A launcher driving a resident diatom over a
 Unix socket is an
 additional mode, not the fundamental one - designing for a program that stands
@@ -62,7 +71,7 @@ a Brick, diatom peaks at **8.2 to 8.4 MB** with FCEUmm running.
 
 | Path | What it is |
 |---|---|
-| `src/` | The host: core loading, environment callbacks, frame loop, resampling, saves, the launcher protocol, volume and brightness |
+| `src/` | The host: core loading, environment callbacks, frame loop, resampling, saves, the launcher protocol, volume and brightness, a DS frame's two screens and its stylus |
 | `port/` | Per-device backends. `desktop` (SDL2), `brick` (raw fbdev) and `pixel2` (GLES on KMS). Pixels, samples, buttons, time, and the hardware under the levels - nothing else |
 | `include/diatom_port.h` | The one load-bearing seam, and the rules that keep it honest |
 | `test/stubcore.c` | A libretro core that is not an emulator, so the frontend can be exercised with no third-party binary |

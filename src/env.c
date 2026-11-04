@@ -33,6 +33,20 @@ void diatom_env_suppress(uint32_t mask)
 	g_suppress = mask;
 }
 
+/* The libretro pointer, for a core with a touch screen (RETRO_DEVICE_POINTER):
+ * set by the host once a frame from the stylus (screens.h), read by the core
+ * inside retro_run. Nothing here moves it, so a core that never asks costs
+ * nothing, and one that asks with no stylus gets "not pressed". */
+static bool    g_ptr_down;
+static int16_t g_ptr_x, g_ptr_y;
+
+void diatom_env_pointer(bool down, int16_t x, int16_t y)
+{
+	g_ptr_down = down;
+	g_ptr_x = x;
+	g_ptr_y = y;
+}
+
 /* The game's rotation, in quarter turns counter-clockwise, as SET_ROTATION
  * gave it. A core says it while loading a game, and a resident core loads
  * many: the last game's answer must not turn the next one, so it is cleared
@@ -436,6 +450,17 @@ static bool env_cb(unsigned cmd, void *data)
 		*(unsigned *)data = RETRO_LANGUAGE_ENGLISH;
 		return true;
 
+	/* ---- declined, and said so ------------------------------------------ */
+	case MASK(RETRO_ENVIRONMENT_GET_MICROPHONE_INTERFACE):
+		/* No microphone. The GKD Pixel 2 has none to offer, nor the Brick,
+		 * and a desktop's is not worth a port function nobody would use.
+		 * dsperate-lr asks once a game, at load, and on false clears its
+		 * interface and never asks again: a game that listens hears
+		 * silence, the DS's own answer with nobody speaking. Listed here,
+		 * rather than left to the default, so the next person to read the
+		 * environment finds the decision and not an absence. */
+		return false;
+
 	default:
 		/* Declined on purpose. The 17 commands cores ask for and shrug off
 		 * when refused are listed in the spike; anything new lands here too. */
@@ -738,7 +763,15 @@ static int16_t cb_input_state(unsigned port, unsigned device,
 	uint32_t state;
 	int b;
 
-	(void)index;
+	if (port == 0 && device == RETRO_DEVICE_POINTER && index == 0) {
+		switch (id) {
+		case RETRO_DEVICE_ID_POINTER_X:       return g_ptr_x;
+		case RETRO_DEVICE_ID_POINTER_Y:       return g_ptr_y;
+		case RETRO_DEVICE_ID_POINTER_PRESSED: return g_ptr_down;
+		case RETRO_DEVICE_ID_POINTER_COUNT:   return g_ptr_down ? 1 : 0;
+		default:                              return 0;
+		}
+	}
 	if (port != 0 || device != RETRO_DEVICE_JOYPAD) return 0;
 
 	state = diatom_port_input_state() & ~g_suppress;

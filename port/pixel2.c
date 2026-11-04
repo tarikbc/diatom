@@ -104,6 +104,10 @@ typedef struct {
 	diatom_pixfmt fmt;
 	diatom_rect   dst;
 	diatom_filter filter;
+	/* The planes in force when this frame was presented, so a layout change
+	 * and the frame it was made for reach the panel together. */
+	diatom_plane  planes[DIATOM_PLANES_MAX];
+	int           nplanes;
 } mailbox_frame;
 
 static mailbox_frame    g_frames[MAILBOX_FRAMES];
@@ -568,10 +572,10 @@ static void to_clip(float x, float y, bool turned, float *out)
 
 /* One textured or solid quad. `src` is in texels, matching the rect's corners:
  * top-left, top-right, bottom-left, bottom-right. */
-static void draw_quad(float x, float y, float w, float h,
-                      float sw, float sh, bool turned)
+static void draw_quad_from(float x, float y, float w, float h,
+                           float sx, float sy, float sw, float sh, bool turned)
 {
-	float pos[8], src[8] = { 0, 0, sw, 0, 0, sh, sw, sh };
+	float pos[8], src[8] = { sx, sy, sx + sw, sy, sx, sy + sh, sx + sw, sy + sh };
 
 	to_clip(x,     y,     turned, &pos[0]);
 	to_clip(x + w, y,     turned, &pos[2]);
@@ -582,6 +586,12 @@ static void draw_quad(float x, float y, float w, float h,
 	glEnableVertexAttribArray(0);
 	glEnableVertexAttribArray(1);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+static void draw_quad(float x, float y, float w, float h,
+                      float sw, float sh, bool turned)
+{
+	draw_quad_from(x, y, w, h, 0, 0, sw, sh, turned);
 }
 
 static void solid(float x, float y, float w, float h,
@@ -731,12 +741,36 @@ static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
 	glUniform2f(glGetUniformLocation(prog, "u_size"), (float)f->w, (float)f->h);
 	glUniformMatrix3fv(glGetUniformLocation(prog, "u_matrix"), 1, GL_TRUE, g_matrix);
 	glUniform1i(glGetUniformLocation(prog, "u_panel"), g_matrix_on);
-	if (prog == g_prog_sharp)
-		glUniform2f(glGetUniformLocation(prog, "u_scale"),
-		            (float)f->dst.w / (float)f->w, (float)f->dst.h / (float)f->h);
-	/* dst may reach past the surface (fill, overscale): GL clips it. */
-	draw_quad((float)f->dst.x, (float)f->dst.y, (float)f->dst.w, (float)f->dst.h,
-	          (float)f->w, (float)f->h, turned);
+	if (f->nplanes) {
+		/* A DS frame's two screens, each its own quad out of the one
+		 * texture (diatom_port_planes). Sharp's steepness is per quad: the
+		 * two screens of a focus layout are at 2x and 0.5x. The sampler
+		 * clamps only at the texture's edge, so with a linear filter a
+		 * screen's last row can take a little of the other screen's first,
+		 * where the two meet in the middle of the texture; nearest never
+		 * reaches past its own texel. */
+		int i;
+
+		for (i = 0; i < f->nplanes; i++) {
+			const diatom_plane *p = &f->planes[i];
+
+			if (prog == g_prog_sharp)
+				glUniform2f(glGetUniformLocation(prog, "u_scale"),
+				            (float)p->dst.w / (float)p->src.w,
+				            (float)p->dst.h / (float)p->src.h);
+			draw_quad_from((float)p->dst.x, (float)p->dst.y,
+			               (float)p->dst.w, (float)p->dst.h,
+			               (float)p->src.x, (float)p->src.y,
+			               (float)p->src.w, (float)p->src.h, turned);
+		}
+	} else {
+		if (prog == g_prog_sharp)
+			glUniform2f(glGetUniformLocation(prog, "u_scale"),
+			            (float)f->dst.w / (float)f->w, (float)f->dst.h / (float)f->h);
+		/* dst may reach past the surface (fill, overscale): GL clips it. */
+		draw_quad((float)f->dst.x, (float)f->dst.y, (float)f->dst.w, (float)f->dst.h,
+		          (float)f->w, (float)f->h, turned);
+	}
 
 	/* Alpha in the target stays 1 whatever is blended over it: the scanout
 	 * format carries alpha, and this display controller is not trusted to
@@ -1168,6 +1202,20 @@ static void drain(void)
 
 /* ==================== the port interface ==================================== */
 
+/* Set from the host's thread and read only there, by present, which copies
+ * them into the frame it fills: the flip thread never sees these. */
+static diatom_plane g_planes[DIATOM_PLANES_MAX];
+static int          g_nplanes;
+
+void diatom_port_planes(const diatom_plane *planes, int n)
+{
+	if (!planes || n < 0) n = 0;
+	if (n > DIATOM_PLANES_MAX) n = DIATOM_PLANES_MAX;
+	if (n) memcpy(g_planes, planes, sizeof *planes * (size_t)n);
+	g_nplanes = n;
+	port_logf(DIATOM_LOG_INFO, "present: %d plane(s)%s", n, n ? "" : ", the whole frame");
+}
+
 void diatom_port_present(const void *src, int w, int h, size_t pitch,
                          diatom_pixfmt fmt, diatom_rect dst, diatom_filter filter)
 {
@@ -1226,6 +1274,8 @@ void diatom_port_present(const void *src, int w, int h, size_t pitch,
 	f->fmt = fmt;
 	f->dst = dst;
 	f->filter = filter;
+	f->nplanes = g_nplanes;
+	if (g_nplanes) memcpy(f->planes, g_planes, sizeof g_planes[0] * (size_t)g_nplanes);
 
 	pthread_mutex_lock(&g_mx);
 	g_presented = true;

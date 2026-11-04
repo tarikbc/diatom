@@ -118,6 +118,10 @@ bool diatom_env_new_geometry(int *w, int *h, double *aspect);   /* consumes the 
  * chord. */
 void diatom_env_suppress(uint32_t mask);
 
+/* The libretro pointer the core reads this frame: the stylus's, from
+ * screens.h, in the whole frame's -0x7fff..0x7fff. See env.c. */
+void diatom_env_pointer(bool down, int16_t x, int16_t y);
+
 /* Silence a core's DEBUG/INFO chatter once a game is running, and log each of
  * its warnings only the first time. See core_log in env.c for the measurements
  * that made this necessary. */
@@ -193,6 +197,12 @@ typedef enum {
 	DIATOM_MSG_SETLOWBATTERY,/* show it over the game, or not: `on`, `blink` */
 	DIATOM_MSG_DISC,       /* report the disc in the tray, and how many */
 	DIATOM_MSG_SETDISC,    /* change to disc `index`, counted from 0 */
+	/* Two screens in one frame (a DS game, RUN screens=2): where each goes,
+	 * and the stylus that touches the bottom one. See screens.h. */
+	DIATOM_MSG_SCREENS,    /* report the layout and whether it applies */
+	DIATOM_MSG_SETSCREENS, /* set it: `layout`, `swap` = 1 | 0 */
+	DIATOM_MSG_STYLUS,     /* report whether stylus mode is on */
+	DIATOM_MSG_SETSTYLUS,  /* turn it on or off: `on` = 1 | 0 */
 	/* The launcher went away - or was displaced by a newer one, which means
 	 * the same thing. The game keeps running. */
 	DIATOM_MSG_HANGUP
@@ -214,6 +224,16 @@ typedef struct {
 	 * optional for them: an RA address is an offset into a per-console space,
 	 * so 0x06f3 means nothing until the launcher says which console. */
 	char cheevos[1024];    /* RUN: a set to watch from the first frame */
+	/* RUN: 2 when the frame holds two screens, top over bottom - a DS game.
+	 * The launcher's to say, since it knows which shelf a game is on and
+	 * Diatom has no core list. Anything else is one screen. */
+	int  screens;
+	/* RUN: "late" lets a core with a frameskip leave out the drawing of a
+	 * frame that is running late, at 1x as well as fast. Empty: only fast
+	 * forward skips, as before. */
+	char frameskip[16];
+	char layout[16];       /* SETSCREENS: a name from scr_layout_names */
+	char swap[4];          /* SETSCREENS: "1" | "0"; empty leaves it */
 	int  console;          /* RUN / SETCHEEVOS */
 	char path[1024];       /* SAVE / LOAD / SETCHEEVOS */
 	char key[80];          /* SETOPT */
