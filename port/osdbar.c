@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/osdbar.c, which is where it is changed: the
- * launcher, this port and portkeys draw the same bar from the same code. Copy
+/* Vendored from ZyperOS (TortOS) src/osdbar.c at 65f3f90, which is where it is changed:
+ * the launcher, this port and portkeys draw the same bar from the same code. Copy
  * it back here whole when it changes there. */
 /* The volume and brightness bar's pixels. See src/osdbar.h. */
 #include "osdbar.h"
@@ -23,21 +23,26 @@
 #define SEG_H    16.0f
 #define SEG_GAP  4.0f
 #define SEG_R    3.0f
-#define SHADOW_DY   4.0f
-#define SHADOW_SOFT 8.0f           /* units over which its edge fades */
-#define SHADOW_A    0.40f
+#define SHADOW_DY   DS_SHADOW_BAR_Y
+#define SHADOW_SOFT DS_SHADOW_BAR_BLUR  /* units over which its edge fades */
 #define BODY_A      0.93f          /* the game still reads through, faintly */
 
-/* The menu panel's surface and a hairline a step lighter (src/ui.c ui_panel),
- * the track the old line ran in, and its two colors, fixed per function rather
- * than taken from the system accent, which would make one control change color
- * as you scrolled past it: the color of light for brightness, the launcher's
- * own cyan (src/ui.h UI_CYAN_*) for volume. */
-static const float PANEL[3]  = {  22,  24,  32 };
-static const float EDGE[3]   = {  48,  52,  66 };
-static const float TRACK[3]  = {  60,  62,  72 };
-static const float VOLUME[3] = {  61, 214, 255 };
-static const float BRIGHT[3] = { 255, 206, 128 };
+/* The colors are the design's (src/design.h), by role, in whichever theme the
+ * caller names: the pill is a `surface` with an `edge` rim, a step not yet
+ * reached is `track`, and the steps reached are one of two colors fixed per
+ * function rather than taken from the system accent, which would make one
+ * control change color as you scrolled past it - `light` for brightness,
+ * `accent-ink` for volume. Accent-ink and not the accent: in Beard the accent
+ * lime is 1.3:1 on the ground, a mark nobody could see, so the darker ink of
+ * it is used, and in Salt & Pepper the two are the same lime. The shadow is
+ * `ink` at the theme's own opacity, `bar_shadow`: 40% against a dark ground,
+ * 18% on a light one, where a shadow is the only lift there is. */
+static void rgb3(float out[3], ds_rgb c)
+{
+	out[0] = c.r;
+	out[1] = c.g;
+	out[2] = c.b;
+}
 
 /* ---- distances --------------------------------------------------------------
  *
@@ -256,28 +261,35 @@ void osdbar_size(float scale, int *w, int *h)
 }
 
 void osdbar_render(uint32_t *px, int w, int h, int stride, float scale,
-                   int kind, int level, int max, float alpha, bool premul)
+                   int theme, int kind, int level, int max, float alpha, bool premul)
 {
 	/* The largest the bar is ever drawn, at scale 1: 476 x 92 pixels. */
 	static float f[OSDBAR_W * OSDBAR_H * 4];
 	canvas cv = { f, w, h, scale };
-	const float *col = kind == OSDBAR_BRIGHT ? BRIGHT : VOLUME;
+	const ds_theme *th;
+	float col[3], track[3], surface[3], edge[3], ink[3];
 	const float pix = 1.0f / scale;            /* a pixel, in units */
 	const float cy = PILL_Y0 + PILL_H / 2;
 	shape sh = rbox(PILL_X0, PILL_Y0 + SHADOW_DY, PILL_X0 + PILL_W, PILL_Y0 + PILL_H + SHADOW_DY, PILL_R);
 	shape body = rbox(PILL_X0, PILL_Y0, PILL_X0 + PILL_W, PILL_Y0 + PILL_H, PILL_R);
-	static const float black[3] = { 0, 0, 0 };
 	float sw;
 	int i, x, y;
 
 	if ((size_t)w * h > sizeof f / sizeof f[0] / 4) return;
+	if (theme < 0 || theme >= DS_THEMES) theme = DS_LIGHT;
+	th = &DS_THEME[theme];
+	rgb3(col, kind == OSDBAR_BRIGHT ? th->light : th->accent_ink);
+	rgb3(track, th->track);
+	rgb3(surface, th->surface);
+	rgb3(edge, th->edge);
+	rgb3(ink, th->ink);
 	if (max < 1) max = 1;
 	if (level < 0) level = 0;
 	if (level > max) level = max;
 	memset(f, 0, (size_t)w * h * 4 * sizeof f[0]);
 
-	paint(&cv, &sh, black, SHADOW_A, SHADOW_SOFT, NULL, 0);
-	paint(&cv, &body, EDGE, BODY_A, pix, PANEL, BORDER);
+	paint(&cv, &sh, ink, th->bar_shadow / 255.0f, SHADOW_SOFT, NULL, 0);
+	paint(&cv, &body, edge, BODY_A, pix, surface, BORDER);
 	if (kind == OSDBAR_BRIGHT) sun(&cv, ICON_CX, cy, level, max, col, pix);
 	else                       speaker(&cv, ICON_CX, cy, level, max, col, pix);
 
@@ -286,7 +298,7 @@ void osdbar_render(uint32_t *px, int w, int h, int stride, float scale,
 	for (i = 0; i < max; i++) {
 		float x0 = SEG_X0 + i * (sw + SEG_GAP);
 		shape seg = rbox(x0, cy - SEG_H / 2, x0 + sw, cy + SEG_H / 2, SEG_R);
-		paint(&cv, &seg, i < level ? col : TRACK, 1, pix, NULL, 0);
+		paint(&cv, &seg, i < level ? col : track, 1, pix, NULL, 0);
 	}
 
 	if (alpha < 0) alpha = 0;
@@ -303,16 +315,14 @@ void osdbar_render(uint32_t *px, int w, int h, int stride, float scale,
 		}
 }
 
-static float ease_out(float t)
-{
-	t = clampf(t, 0, 1);
-	return 1 - (1 - t) * (1 - t) * (1 - t);
-}
-
+/* The way in is the design's `out` curve, the quintic ease-out every arrival
+ * uses (DESIGN.md 8): 87% of the way there a third into the time, so a press
+ * shows at once and then settles. The way out is its `fade`, linear, the
+ * opacity of something going away. */
 bool osdbar_envelope(uint32_t since_shown, uint32_t since_change,
                      float *alpha, float *rise)
 {
-	float in = ease_out((float)since_shown / OSDBAR_IN_MS);
+	float in = ds_out((float)since_shown / OSDBAR_IN_MS);
 	float out = 1;
 
 	if (since_change >= OSDBAR_HOLD_MS + OSDBAR_OUT_MS) return false;

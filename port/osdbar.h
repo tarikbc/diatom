@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later OR MPL-2.0 */
-/* Vendored from ZyperOS (TortOS) src/osdbar.h, which is where it is changed: the
- * launcher, this port and portkeys draw the same bar from the same code. Copy
+/* Vendored from ZyperOS (TortOS) src/osdbar.h at 65f3f90, which is where it is changed:
+ * the launcher, this port and portkeys draw the same bar from the same code. Copy
  * it back here whole when it changes there. */
 #ifndef TORTOS_OSDBAR_H
 #define TORTOS_OSDBAR_H
@@ -11,11 +11,16 @@
  *
  * A pill at the top center of the screen: the setting's mark on the left (a
  * speaker, with a cross at silence, or a sun whose rays grow with the level)
- * and one segment per step to its right, filled up to the level. The colors
- * are the old line's, fixed per function: cyan for volume, warm for
- * brightness. Segments rather than a smooth fill because the levels ARE
- * steps - twenty presses of the volume, eleven of the brightness - and a
- * player can count where they are and how far there is to go.
+ * and one segment per step to its right, filled up to the level. Every color
+ * and time is a token of src/design.h (DESIGN.md 11.6), drawn in the theme
+ * the caller names, Beard or Salt & Pepper: the surface and edge for the
+ * pill, the track for a step not yet reached, and for the steps reached a
+ * color fixed per function rather than the system's, which would make one
+ * control change color as you scrolled past it - accent-ink for volume, the
+ * color of light for brightness. Segments rather than a smooth fill because
+ * the levels ARE steps - twenty presses of the volume, eleven of the
+ * brightness - and a player can count where they are and how far there is
+ * to go.
  *
  * Why pixels and not SDL draws: two of the three places have no SDL. Diatom
  * draws its overlay with GLES, and portkeys has only a KMS buffer on the
@@ -26,7 +31,7 @@
  * caller does not see, nothing but libm.
  *
  * Under either license above: TortOS is GPL and Diatom, which carries a copy
- * of these two files in its port/, is MPL.
+ * of these two files in its port/, with src/design.h they read, is MPL.
  *
  * The geometry is in DESIGN UNITS, the launcher's 1024x768 drawing space,
  * and `scale` is output pixels per unit: 1 for TortOS, 0.625 for the Pixel 2's
@@ -35,6 +40,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "design.h"
 
 enum { OSDBAR_BRIGHT = 1, OSDBAR_VOLUME = 2 };   /* plat_osd_show's kinds */
 
@@ -46,26 +53,32 @@ enum { OSDBAR_BRIGHT = 1, OSDBAR_VOLUME = 2 };   /* plat_osd_show's kinds */
 #define OSDBAR_X ((1024 - OSDBAR_W) / 2)
 #define OSDBAR_Y 10
 
-/* Its life, the same everywhere: in over OSDBAR_IN_MS, sliding down
- * OSDBAR_RISE units as it fades up; held until OSDBAR_HOLD_MS after the last
- * change; out over OSDBAR_OUT_MS. A change while it fades out brings it back
- * to full at once, where it is - no second slide for a bar already there. */
-#define OSDBAR_IN_MS   120
-#define OSDBAR_HOLD_MS 1500
-#define OSDBAR_OUT_MS  240
+/* Its life, the same everywhere, on the design's motion tokens: in over
+ * OSDBAR_IN_MS (quick) on the quintic ease-out, sliding down OSDBAR_RISE
+ * units as it fades up; held until OSDBAR_HOLD_MS (hold.bar) after the last
+ * change; out over OSDBAR_OUT_MS (fade.out), linearly. A change while it
+ * fades out brings it back to full at once, where it is - no second slide
+ * for a bar already there. The names stay so a host written before the
+ * tokens still builds. */
+#define OSDBAR_IN_MS   DS_MS_QUICK
+#define OSDBAR_HOLD_MS DS_MS_HOLD_BAR
+#define OSDBAR_OUT_MS  DS_MS_FADE_OUT
 #define OSDBAR_RISE    14
 
 /* The buffer's size in pixels at `scale`. */
 void osdbar_size(float scale, int *w, int *h);
 
 /* Draws the bar into px, w x h from osdbar_size, `stride` pixels a row,
- * clearing what is there. Pixels are 0xAARRGGBB in a uint32_t - ARGB8888 to
- * both SDL and DRM on a little-endian machine. `premul` gives premultiplied
- * color, which the display controller's blending expects; SDL's default
- * blending wants it straight. `alpha` (0..1) is multiplied in, for a host
- * that fades by redrawing rather than by blending the whole thing. */
+ * clearing what is there. `theme` is DS_LIGHT or DS_DARK (src/design.h);
+ * anything else draws DS_LIGHT, Beard, the default, as a theme read from a
+ * file another process wrote may be anything. Pixels are 0xAARRGGBB in a
+ * uint32_t - ARGB8888 to both SDL and DRM on a little-endian machine.
+ * `premul` gives premultiplied color, which the display controller's
+ * blending expects; SDL's default blending wants it straight. `alpha`
+ * (0..1) is multiplied in, for a host that fades by redrawing rather than by
+ * blending the whole thing. */
 void osdbar_render(uint32_t *px, int w, int h, int stride, float scale,
-                   int kind, int level, int max, float alpha, bool premul);
+                   int theme, int kind, int level, int max, float alpha, bool premul);
 
 /* Where in its life the bar is, from the milliseconds since it appeared and
  * since the last change: false once it is gone, else its opacity (0..1) and

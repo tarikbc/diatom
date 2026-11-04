@@ -50,6 +50,7 @@
 #include "osdbar.h"
 #include "port_clock.h"
 #include "port_cpufreq.h"
+#include "themefile.h"
 
 #define AUDIO_RATE 48000
 /* Capacity in FRAMES, the Brick's figure: 4096 at 48 kHz is about 85 ms, with
@@ -148,10 +149,12 @@ static uint64_t       g_ov_until;
 static bool           g_ov_dirty;           /* a new image to upload */
 
 /* The level bar: when it came up and when it last changed, which is all its
- * slide and fade need (osdbar_envelope). */
+ * slide and fade need (osdbar_envelope), and the theme it draws in, which the
+ * launcher says in THEME_FILE and osd_show reads on each press. */
 static uint64_t g_osd_shown, g_osd_changed;
 static bool     g_osd_on;
 static int      g_osd_level, g_osd_max, g_osd_kind;   /* kind 0 volume, 1 brightness */
+static int      g_osd_theme;                          /* DS_LIGHT or DS_DARK */
 static bool     g_lowbat, g_lowbat_blink;   /* the low-battery disc; under g_mx */
 
 /* ---------- levels ---------------------------------------------------------- */
@@ -417,6 +420,11 @@ static void gain_jack_poll(void)
 
 static void osd_show(int kind, int level, int max)
 {
+	/* The theme is the launcher's, in a file: read before g_mx is taken, so
+	 * the render thread is never kept waiting on the filesystem, and again
+	 * on every press, so a change while the bar is up shows on the next one. */
+	int theme = themefile_read(THEME_FILE);
+
 	pthread_mutex_lock(&g_mx);
 	uint64_t now = diatom_port_now_us();
 	float a, rise;
@@ -430,6 +438,7 @@ static void osd_show(int kind, int level, int max)
 	g_osd_kind  = kind;
 	g_osd_level = level;
 	g_osd_max   = max;
+	g_osd_theme = theme;
 	g_osd_changed = now;
 	pthread_mutex_unlock(&g_mx);
 }
@@ -659,27 +668,29 @@ static void upload_frame(const mailbox_frame *f)
  * is TortOS's src/osdbar.c), so a volume press looks the same in a game as on
  * the shelf and over a port. Drawn into pixels at the surface's scale - 0.625
  * of the launcher's 1024 on the 640x480 panel - and redrawn only when the
- * level or the fade moves; the slide is the quad's place. BGRA with straight
- * alpha, the overlay's own layout, so it goes up the overlay's way. Not
- * through the panel's color matrix: the shelf is not, and the bar is the
- * shelf's. */
-static void draw_level_bar(int kind, int level, int max, float alpha, float rise,
-                           bool turned)
+ * level, the fade or the theme moves; the slide is the quad's place. BGRA
+ * with straight alpha, the overlay's own layout, so it goes up the overlay's
+ * way. Not through the panel's color matrix: the shelf is not, and the bar is
+ * the shelf's. */
+static void draw_level_bar(int kind, int level, int max, int theme, float alpha,
+                           float rise, bool turned)
 {
 	static uint32_t px[OSDBAR_W * OSDBAR_H];
-	static int drawn_kind = -1, drawn_level, drawn_max, drawn_a, w, h;
+	static int drawn_kind = -1, drawn_level, drawn_max, drawn_theme, drawn_a, w, h;
 	const float s = (float)g_surface_w / 1024.0f;
 	int a = (int)(alpha * 255 + 0.5f);
 
 	if (s <= 0 || s > 1) return;
-	if (kind != drawn_kind || level != drawn_level || max != drawn_max || a != drawn_a) {
+	if (kind != drawn_kind || level != drawn_level || max != drawn_max ||
+	    theme != drawn_theme || a != drawn_a) {
 		osdbar_size(s, &w, &h);
-		osdbar_render(px, w, h, w, s, kind ? OSDBAR_BRIGHT : OSDBAR_VOLUME,
+		osdbar_render(px, w, h, w, s, theme, kind ? OSDBAR_BRIGHT : OSDBAR_VOLUME,
 		              level, max, alpha, false);
 		glBindTexture(GL_TEXTURE_2D, g_osdbar_tex);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-		drawn_kind = kind; drawn_level = level; drawn_max = max; drawn_a = a;
+		drawn_kind = kind; drawn_level = level; drawn_max = max;
+		drawn_theme = theme; drawn_a = a;
 	}
 	glBindTexture(GL_TEXTURE_2D, g_osdbar_tex);
 	glUseProgram(g_prog_plain);
@@ -754,7 +765,7 @@ static void matrix_load(void)
 
 /* Draw one frame and whatever is over it, onto the current target. */
 static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
-                       int osd_kind, int osd_level, int osd_max,
+                       int osd_kind, int osd_level, int osd_max, int osd_theme,
                        float osd_alpha, float osd_rise, bool lowbat,
                        bool turned)
 {
@@ -824,7 +835,8 @@ static void draw_scene(const mailbox_frame *f, bool overlay_live, bool osd_live,
 		          (float)g_ov_w, (float)g_ov_h, turned);
 	}
 	if (osd_live)
-		draw_level_bar(osd_kind, osd_level, osd_max, osd_alpha, osd_rise, turned);
+		draw_level_bar(osd_kind, osd_level, osd_max, osd_theme, osd_alpha, osd_rise,
+		               turned);
 	if (lowbat)
 		draw_low_battery(turned);
 	glDisable(GL_BLEND);
@@ -1106,7 +1118,7 @@ static bool capture_front(int front, const char *path)
 	glViewport(0, 0, g_surface_w, g_surface_h);
 
 	upload_frame(&g_frames[front]);
-	draw_scene(&g_frames[front], false, false, 0, 0, 0, 0, 0, false, false);
+	draw_scene(&g_frames[front], false, false, 0, 0, 0, 0, 0, 0, false, false);
 	glReadPixels(0, 0, g_surface_w, g_surface_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1143,7 +1155,7 @@ static void *present_thread(void *arg)
 	while (!g_thread_stop) {
 		int frame;
 		bool ov_live, osd_live, lowbat;
-		int osd_kind, osd_level, osd_max;
+		int osd_kind, osd_level, osd_max, osd_theme;
 		float osd_alpha = 0, osd_rise = 0;
 		uint64_t now, t0 = 0;
 
@@ -1203,6 +1215,7 @@ static void *present_thread(void *arg)
 		osd_kind  = g_osd_kind;
 		osd_level = g_osd_level;
 		osd_max   = g_osd_max;
+		osd_theme = g_osd_theme;
 		/* Blinking: the even seconds, the launcher's rhythm. */
 		lowbat    = g_lowbat && (!g_lowbat_blink || (now / 1000000u) % 2 == 0);
 		pthread_mutex_unlock(&g_mx);
@@ -1210,7 +1223,7 @@ static void *present_thread(void *arg)
 		if (g_present_debug) t0 = diatom_port_now_us();
 		upload_frame(&g_frames[frame]);
 		draw_scene(&g_frames[frame], ov_live, osd_live, osd_kind, osd_level,
-		           osd_max, osd_alpha, osd_rise, lowbat, g_turned);
+		           osd_max, osd_theme, osd_alpha, osd_rise, lowbat, g_turned);
 		eglSwapBuffers(g_egl_display, g_egl_surface);
 		if (g_present_debug) {
 			static int n;
