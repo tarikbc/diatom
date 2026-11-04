@@ -12,6 +12,7 @@
  * directory on the include path, and this is the form SDL documents. */
 #include <SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
 
@@ -26,6 +27,7 @@
 #define AUDIO_BUFFER_FRAMES 4096
 #define AUDIO_FRAME_BYTES   (2 * (int)sizeof(int16_t))
 
+static int           g_win_w = WINDOW_W, g_win_h = WINDOW_H;
 static SDL_Window   *g_window;
 static SDL_Renderer *g_renderer;
 static SDL_Texture  *g_texture;
@@ -160,9 +162,22 @@ bool diatom_port_init(diatom_port_caps *out)
 		return false;
 	}
 
+	/* DIATOM_SURFACE=640x480 makes the window a device's size, so a layout
+	 * worked out for the GKD Pixel 2's panel can be seen, and captured, at
+	 * the size it was worked out for. Anything else is the default. */
+	{
+		const char *e = getenv("DIATOM_SURFACE");
+		int w, h;
+
+		if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120 &&
+		    w <= 4096 && h <= 4096) {
+			g_win_w = w;
+			g_win_h = h;
+		}
+	}
 	g_window = SDL_CreateWindow("diatom",
 		SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-		WINDOW_W, WINDOW_H, SDL_WINDOW_SHOWN);
+		g_win_w, g_win_h, SDL_WINDOW_SHOWN);
 	if (!g_window) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
 
 	g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
@@ -197,8 +212,8 @@ bool diatom_port_init(diatom_port_caps *out)
 	/* No audio here: it opens once the launcher has drawn, or at the first
 	 * game; see diatom_port_audio_start. */
 
-	out->surface_w          = WINDOW_W;
-	out->surface_h          = WINDOW_H;
+	out->surface_w          = g_win_w;
+	out->surface_h          = g_win_h;
 	/* `have` is untouched when the open failed, so the rate comes from what
 	 * was asked for: the resampler still needs a target to convert into,
 	 * and a zero here would divide. */
@@ -300,17 +315,40 @@ static void draw_overlay(void)
 	SDL_RenderCopy(g_renderer, g_ov_tex, NULL, &r);
 }
 
+/* See diatom_port_planes: each plane is one more copy out of the same
+ * texture, a source rect to a destination rect, which SDL's renderer does as
+ * it does the whole frame. */
+static diatom_plane g_planes[DIATOM_PLANES_MAX];
+static int          g_nplanes;
+
+void diatom_port_planes(const diatom_plane *planes, int n)
+{
+	if (!planes || n < 0) n = 0;
+	if (n > DIATOM_PLANES_MAX) n = DIATOM_PLANES_MAX;
+	if (n) memcpy(g_planes, planes, sizeof *planes * (size_t)n);
+	g_nplanes = n;
+}
+
 void diatom_port_present(const void *src, int w, int h, size_t pitch,
                          diatom_pixfmt fmt, diatom_rect dst,
                          diatom_filter filter)
 {
-	SDL_Rect r;
+	SDL_Rect r, sr;
+	int i;
 
 	if (w > 0 && h > 0 && !ensure_texture(w, h, fmt, filter)) return;
 	if (src && g_texture) SDL_UpdateTexture(g_texture, NULL, src, (int)pitch);
 
 	SDL_RenderClear(g_renderer);
-	if (g_texture) {
+	if (g_texture && g_nplanes) {
+		for (i = 0; i < g_nplanes; i++) {
+			sr.x = g_planes[i].src.x; sr.y = g_planes[i].src.y;
+			sr.w = g_planes[i].src.w; sr.h = g_planes[i].src.h;
+			r.x = g_planes[i].dst.x; r.y = g_planes[i].dst.y;
+			r.w = g_planes[i].dst.w; r.h = g_planes[i].dst.h;
+			SDL_RenderCopy(g_renderer, g_texture, &sr, &r);
+		}
+	} else if (g_texture) {
 		r.x = dst.x; r.y = dst.y; r.w = dst.w; r.h = dst.h;
 		SDL_RenderCopy(g_renderer, g_texture, NULL, &r);
 	}
@@ -387,6 +425,60 @@ static const struct { SDL_Scancode key; int btn; } keymap[] = {
 	{ SDL_SCANCODE_ESCAPE, DIATOM_BTN_MENU   },
 };
 
+/* DIATOM_INPUT_SCRIPT: buttons held by script rather than by hand, for a
+ * window nobody can type into - an offscreen SDL in a container. A list of
+ * `poll:buttons` steps separated by `;`, each holding its buttons (names as
+ * the protocol's, joined by `+`, none for nothing) from that poll on:
+ *
+ *     DIATOM_INPUT_SCRIPT='300:start;306:;400:l2;406:;420:r2;426:'
+ *
+ * A poll is a frame: the core polls once in each. OR'd with the keyboard,
+ * so a script and a person can share a window. Read once, at the first poll. */
+static struct { long at; uint32_t held; } g_script[64];
+static int  g_script_n = -1;
+static long g_polls;
+
+static void script_load(void)
+{
+	static const char *const names[DIATOM_BTN_COUNT] = {
+		"up", "down", "left", "right", "a", "b", "x", "y",
+		"l1", "r1", "l2", "r2", "select", "start", "menu"
+	};
+	const char *e = getenv("DIATOM_INPUT_SCRIPT");
+	char buf[2048], *step, *save = NULL;
+
+	g_script_n = 0;
+	if (!e || !*e) return;
+	snprintf(buf, sizeof buf, "%s", e);
+	for (step = strtok_r(buf, ";", &save); step && g_script_n < 64;
+	     step = strtok_r(NULL, ";", &save)) {
+		char *colon = strchr(step, ':'), *b, *bs = NULL;
+		uint32_t held = 0;
+		int k;
+
+		if (!colon) continue;
+		*colon = '\0';
+		for (b = strtok_r(colon + 1, "+", &bs); b; b = strtok_r(NULL, "+", &bs))
+			for (k = 0; k < DIATOM_BTN_COUNT; k++)
+				if (!strcmp(b, names[k])) held |= DIATOM_BIT(k);
+		g_script[g_script_n].at = strtol(step, NULL, 10);
+		g_script[g_script_n].held = held;
+		g_script_n++;
+	}
+	fprintf(stderr, "desktop: input script of %d step(s)\n", g_script_n);
+}
+
+static uint32_t script_held(void)
+{
+	uint32_t held = 0;
+	int i;
+
+	if (g_script_n < 0) script_load();
+	g_polls++;
+	for (i = 0; i < g_script_n && g_script[i].at <= g_polls; i++) held = g_script[i].held;
+	return held;
+}
+
 void diatom_port_input_poll(void)
 {
 	const Uint8 *keys;
@@ -401,7 +493,7 @@ void diatom_port_input_poll(void)
 	for (i = 0; i < sizeof keymap / sizeof keymap[0]; i++)
 		if (keys[keymap[i].key]) s |= DIATOM_BIT(keymap[i].btn);
 
-	g_buttons = s;
+	g_buttons = s | script_held();
 }
 
 uint32_t diatom_port_input_state(void) { return g_buttons; }

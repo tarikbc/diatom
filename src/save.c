@@ -57,6 +57,17 @@ static uint8_t    *g_staging;     /* the writer's private copy */
 static size_t      g_sram_size;
 static uint64_t    g_last_write;
 
+/* Battery RAM a core sizes only after the game has started: dsperate-lr
+ * gives a DS game its save chip at load when DSperate's save list names the
+ * game, or when an .srm is there to size it from, and otherwise from the
+ * game's first access to the chip - after Diatom asked, at load, and was told
+ * there was none. Without a second look that game's progress was never
+ * written. So a game with no battery at load is looked at again once a second
+ * while it runs, and its chip adopted when one appears. */
+static diatom_core    *g_late_core;
+static unsigned        g_late_ticks;
+#define LATE_EVERY 60
+
 static pthread_t       g_writer;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
@@ -152,14 +163,18 @@ bool diatom_save_init(diatom_core *c, const char *save_dir, const char *rom_path
 	/* Measured: SRAM size is per GAME, not per system. Probotector reports 0,
 	 * Final Fantasy on the same core reports 8 KB. A game with no battery must
 	 * produce no file at all rather than an empty one. */
-	if (!g_sram_size || !g_sram) {
-		logf_(DIATOM_LOG_INFO, "save: no battery in this game");
-		return true;
-	}
-
 	stem(rom_path, name, sizeof name);
 	snprintf(g_sram_path, sizeof g_sram_path, "%s/%s.srm",
 	         save_dir ? save_dir : ".", name);
+
+	g_late_core = NULL;
+	if (!g_sram_size || !g_sram) {
+		logf_(DIATOM_LOG_INFO, "save: no battery in this game, or none yet");
+		g_sram_size = 0;
+		g_late_core = c;
+		g_late_ticks = 0;
+		return true;
+	}
 
 	f = fopen(g_sram_path, "rb");
 	if (f) {
@@ -196,8 +211,48 @@ bool diatom_save_init(diatom_core *c, const char *save_dir, const char *rom_path
 	return true;
 }
 
+/* See g_late_core. Adopted only when there is no file: a file would have sized
+ * the chip at load, so one that is there now and did not is a file this game
+ * did not make, and is not written over. The chip is written at once, since
+ * what made it appear was the game saving. */
+static void late_look(void)
+{
+	size_t n;
+	uint8_t *d;
+
+	if (++g_late_ticks % LATE_EVERY) return;
+	n = g_late_core->get_memory_size(RETRO_MEMORY_SAVE_RAM);
+	d = g_late_core->get_memory_data(RETRO_MEMORY_SAVE_RAM);
+	if (!n || !d) return;
+	g_late_core = NULL;
+	if (access(g_sram_path, F_OK) == 0) {
+		logf_(DIATOM_LOG_WARN, "save: the game made %zu bytes of battery late, and %s "
+		      "is there already; leaving it, nothing saved", n, g_sram_path);
+		return;
+	}
+	g_shadow  = malloc(n);
+	g_staging = malloc(n);
+	if (!g_shadow || !g_staging) {
+		free(g_shadow); free(g_staging);
+		g_shadow = g_staging = NULL;
+		return;
+	}
+	g_sram = d;
+	g_sram_size = n;
+	memcpy(g_shadow, g_sram, n);
+	g_shadow[0] ^= 0xff;            /* differs, so the next tick writes it */
+	g_last_write = 0;
+	logf_(DIATOM_LOG_INFO, "save: the game made %zu bytes of battery; saving to %s",
+	      n, g_sram_path);
+	if (pthread_create(&g_writer, NULL, writer, NULL) == 0)
+		g_running = true;
+	else
+		logf_(DIATOM_LOG_WARN, "save: no writer thread; flushing on exit only");
+}
+
 void diatom_save_tick(void)
 {
+	if (g_late_core) late_look();
 	if (!g_sram_size || !g_running) return;
 	/* memcmp of at most 128 KB, tens of microseconds. Cheap enough to do every
 	 * frame, and most frames find nothing: only games that actually save touch
@@ -243,6 +298,7 @@ void diatom_save_shutdown(void)
 	free(g_shadow); free(g_staging);
 	g_shadow = g_staging = NULL;
 	g_sram_size = 0;
+	g_late_core = NULL;
 }
 
 bool diatom_state_save(diatom_core *c, const char *path)

@@ -38,6 +38,11 @@
  * refuses a disc change with the lid shut, as libretro says a core may, so a
  * frontend that forgets to open the tray first is caught here. See tray below.
  *
+ * And battery RAM that is not there at load and appears later, as a DS core
+ * sizes the save chip of a game its save list does not name from the game's
+ * first access to it (dsperate-lr): STUBCORE_LATE_SRAM=N reports 512 bytes of
+ * SAVE_RAM from frame N, none before, and writes a pattern into them then.
+ *
  * Test fixture. Not part of Diatom's runtime.
  */
 #include <stdint.h>
@@ -67,6 +72,8 @@ static retro_input_state_t   input_cb;
 static uint16_t fb[MAX_W * MAX_H];
 static int      cur_w = BASE_W, cur_h = BASE_H;
 static unsigned frame;
+static uint8_t  late_sram[512];
+static long     late_at = -1;          /* STUBCORE_LATE_SRAM, or -1 */
 static int      box_x = 96, box_y = 80;
 static double   phase;
 static double   audio_accum;
@@ -241,6 +248,10 @@ bool retro_load_game(const struct retro_game_info *game)
 	 * it - the geometry toggle, the crash frame, sysram - means something
 	 * different on the second game than on the first. */
 	frame = 0;
+	{
+		const char *e = getenv("STUBCORE_LATE_SRAM");
+		late_at = e && *e ? strtol(e, NULL, 10) : -1;
+	}
 	/* Offered by every real core and discarded by Diatom until the state
 	 * plane. The port-1 entry is here so the "port 0 only" filter has
 	 * something to exclude rather than being untested. */
@@ -286,13 +297,25 @@ static void sysram_tick(void)
 	                               RETRO_DEVICE_ID_JOYPAD_LEFT) ? 1 : 0);
 }
 
+static bool late_here(void) { return late_at >= 0 && (long)frame >= late_at; }
+
+static void late_tick(void)
+{
+	size_t i;
+
+	if (late_at < 0 || (long)frame != late_at) return;
+	for (i = 0; i < sizeof late_sram; i++) late_sram[i] = (uint8_t)(0x5a ^ i);
+}
+
 void *retro_get_memory_data(unsigned id)
 {
+	if (id == RETRO_MEMORY_SAVE_RAM) return late_here() ? late_sram : NULL;
 	return id == RETRO_MEMORY_SYSTEM_RAM ? sysram : NULL;
 }
 
 size_t retro_get_memory_size(unsigned id)
 {
+	if (id == RETRO_MEMORY_SAVE_RAM) return late_here() ? sizeof late_sram : 0;
 	return id == RETRO_MEMORY_SYSTEM_RAM ? sizeof sysram : 0;
 }
 void retro_reset(void) { frame = 0; }
@@ -332,6 +355,7 @@ void retro_run(void)
 
 	poll_cb();
 	sysram_tick();
+	late_tick();
 
 	/* A box you can drive, so input is verifiable by looking at it. */
 	held = input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT);

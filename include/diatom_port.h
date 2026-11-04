@@ -98,6 +98,26 @@ void diatom_port_present(const void *src, int w, int h, size_t pitch,
                          diatom_pixfmt fmt, diatom_rect dst,
                          diatom_filter filter);
 
+/* Parts of the frame drawn to places of their own: a Nintendo DS frame holds
+ * two screens, top over bottom, and a layout puts each somewhere else on the
+ * panel (src/screens.h). With planes set, present draws each plane's `src`
+ * rect of the frame into its `dst` rect, in order, with the filter it is
+ * given, and ignores its own `dst`; n == 0 goes back to drawing the whole
+ * frame into `dst`.
+ *
+ * Geometry, not policy: the host computed every rect, as it computes `dst`,
+ * and the port only samples. Held until the next call rather than passed per
+ * frame because present's argument list is at its limit (see above) and the
+ * planes change with a layout, not with a frame. `src` rects lie inside the
+ * frame; `dst` rects may reach past the surface and are clipped like `dst`.
+ *
+ * Copied, not borrowed. A port that draws only one rect (the Brick, which
+ * has no DS here) draws the largest plane and is correct enough to be
+ * honest about: one screen, never a garbled two. */
+typedef struct { diatom_rect src, dst; } diatom_plane;
+#define DIATOM_PLANES_MAX 2
+void diatom_port_planes(const diatom_plane *planes, int n);
+
 /* An image composited over the presented frame for a while, in SCREEN space -
  * the same job the port already does for its own level bar, which is why it
  * lives here rather than in the host: the OSD is drawn after scaling, and a
